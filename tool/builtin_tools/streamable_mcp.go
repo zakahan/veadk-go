@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/adk/tool"
@@ -21,6 +22,11 @@ type StreamableMCPConfig struct {
 	HeaderProvider      MCPHeaderProvider
 	EnableStandaloneSSE bool
 	MaxRetries          int
+	// Optional keeps agent execution available when the MCP server is down.
+	// Tool discovery is retried on every subsequent agent invocation, so tools
+	// automatically reappear after the server recovers.
+	Optional                bool
+	OptionalWarningInterval time.Duration
 }
 
 func NewStreamableMCPToolset(config StreamableMCPConfig) (tool.Toolset, error) {
@@ -45,7 +51,7 @@ func NewStreamableMCPToolset(config StreamableMCPConfig) (tool.Toolset, error) {
 		headerProvider: config.HeaderProvider,
 	}
 
-	return mcptoolset.New(mcptoolset.Config{
+	toolset, err := mcptoolset.New(mcptoolset.Config{
 		Transport: &mcp.StreamableClientTransport{
 			Endpoint:             endpoint,
 			HTTPClient:           &clientCopy,
@@ -53,6 +59,13 @@ func NewStreamableMCPToolset(config StreamableMCPConfig) (tool.Toolset, error) {
 			DisableStandaloneSSE: !config.EnableStandaloneSSE,
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	if config.Optional {
+		return newOptionalToolset(toolset, config.OptionalWarningInterval), nil
+	}
+	return toolset, nil
 }
 
 type mcpHeaderRoundTripper struct {
