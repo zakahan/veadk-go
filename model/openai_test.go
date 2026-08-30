@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -29,6 +30,21 @@ import (
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
+
+type countingAPIKeyProvider struct {
+	key         string
+	calls       atomic.Int32
+	invalidates atomic.Int32
+}
+
+func (p *countingAPIKeyProvider) APIKey(context.Context) (string, error) {
+	p.calls.Add(1)
+	return p.key, nil
+}
+
+func (p *countingAPIKeyProvider) Invalidate() {
+	p.invalidates.Add(1)
+}
 
 // mockOpenAIResponse creates a standard OpenAI chat completion response.
 func mockOpenAIResponse(content string, finishReason string) response {
@@ -173,6 +189,107 @@ func newTestModel(t *testing.T, server *httptest.Server) model.LLM {
 		t.Fatalf("failed to create model: %v", err)
 	}
 	return llm
+}
+
+func TestOpenAIModelResolvesAPIKeyLazily(t *testing.T) {
+	provider := &countingAPIKeyProvider{key: "lazy-test-key"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer lazy-test-key" {
+			t.Errorf("Authorization = %q, want Bearer lazy-test-key", got)
+		}
+		if got := r.Header.Get("X-Test-Header"); got != "test-value" {
+			t.Errorf("X-Test-Header = %q, want test-value", got)
+		}
+		_ = json.NewEncoder(w).Encode(mockOpenAIResponse("hello", "stop"))
+	}))
+	defer server.Close()
+
+	llm, err := NewOpenAIModel(context.Background(), "test-model", &ClientConfig{
+		APIKeyProvider: provider,
+		BaseURL:        server.URL,
+		HTTPClient:     server.Client(),
+		ExtraHeaders:   map[string]string{"X-Test-Header": "test-value"},
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIModel() error = %v", err)
+	}
+	if got := provider.calls.Load(); got != 0 {
+		t.Fatalf("provider calls after construction = %d, want 0", got)
+	}
+
+	for _, err := range llm.GenerateContent(t.Context(), &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent() error = %v", err)
+		}
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls after request = %d, want 1", got)
+	}
+}
+
+func TestOpenAIModelInvalidatesProviderAndRetriesAuthFailure(t *testing.T) {
+	provider := &countingAPIKeyProvider{key: "rotated-key"}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(strings.Repeat("expired", 20_000)))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(mockOpenAIResponse("retried", "stop"))
+	}))
+	defer server.Close()
+
+	llm, err := NewOpenAIModel(context.Background(), "test-model", &ClientConfig{
+		APIKeyProvider: provider,
+		BaseURL:        server.URL,
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, err := range llm.GenerateContent(t.Context(), &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		if err != nil {
+			t.Fatalf("GenerateContent() error = %v", err)
+		}
+	}
+	if got, want := requests.Load(), int32(2); got != want {
+		t.Fatalf("requests = %d, want %d", got, want)
+	}
+	if got, want := provider.calls.Load(), int32(2); got != want {
+		t.Fatalf("provider calls = %d, want %d", got, want)
+	}
+	if got, want := provider.invalidates.Load(), int32(1); got != want {
+		t.Fatalf("provider invalidates = %d, want %d", got, want)
+	}
+}
+
+func TestOpenAIModelBoundsAPIErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(strings.Repeat("x", maxAPIErrorBodyBytes+1024)))
+	}))
+	defer server.Close()
+
+	llm, err := NewOpenAIModel(context.Background(), "test-model", &ClientConfig{
+		APIKey: "test-key", BaseURL: server.URL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestErr error
+	for _, err := range llm.GenerateContent(t.Context(), &model.LLMRequest{Contents: genai.Text("hi")}, false) {
+		requestErr = err
+	}
+	if requestErr == nil {
+		t.Fatal("GenerateContent() error = nil")
+	}
+	if !strings.Contains(requestErr.Error(), "[truncated]") {
+		t.Fatalf("error does not report truncation: %v", requestErr)
+	}
+	if got, max := len(requestErr.Error()), maxAPIErrorBodyBytes+256; got > max {
+		t.Fatalf("error length = %d, want <= %d", got, max)
+	}
 }
 
 func TestOpenAIModel_GenerateContentSkipsInvalidExtraBody(t *testing.T) {

@@ -15,11 +15,17 @@
 package skilltool
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
+	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/volcengine/veadk-go/code_executors"
 	"github.com/volcengine/veadk-go/log"
@@ -50,6 +56,7 @@ type SkillToolset struct {
 	skills       map[string]*skills.Skill
 	tools        []tool.Tool
 	codeExecutor code_executors.CodeExecutor
+	localRuntime *LocalRuntime
 }
 
 func NewSkillToolset(skillList []*skills.Skill, codeExecutor code_executors.CodeExecutor) (*SkillToolset, error) {
@@ -89,6 +96,9 @@ func (s *SkillToolset) ProcessRequest(ctx tool.Context, req *model.LLMRequest) e
 	skillList := s.listSkills()
 	skillXML := skills.FormatSkillsAsXML(skillList)
 	instruction := []string{DEFAULT_SKILL_SYSTEM_INSTRUCTION, skillXML}
+	if s.localRuntime != nil {
+		instruction = append(instruction, localRuntimeInstruction)
+	}
 	if req.Config.SystemInstruction == nil {
 		req.Config.SystemInstruction = &genai.Content{
 			Parts: []*genai.Part{
@@ -192,37 +202,35 @@ func (s *SkillToolset) loadSkillResourceToolHandler(ctx tool.Context, args loadS
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("Skill '%s' not found.", args.SkillName), "error_code": "SKILL_NOT_FOUND"}, nil
 	}
-	var content string
-	var found bool
-	if strings.HasPrefix(args.Path, "references/") {
-		name := strings.TrimPrefix(args.Path, "references/")
-		content, found = sk.Resources.GetReference(name)
-	} else if strings.HasPrefix(args.Path, "assets/") {
-		name := strings.TrimPrefix(args.Path, "assets/")
-		content, found = sk.Resources.GetAsset(name)
-	} else if strings.HasPrefix(args.Path, "scripts/") {
-		name := strings.TrimPrefix(args.Path, "scripts/")
-		scr, ok2 := sk.Resources.GetScript(name)
-		if ok2 && scr != nil {
-			content, found = scr.Src, true
+	data, err := sk.ReadResource(args.Path, MAX_SKILL_PAYLOAD_BYTES)
+	if err != nil {
+		errorCode := "INVALID_RESOURCE_PATH"
+		if errors.Is(err, os.ErrNotExist) {
+			errorCode = "RESOURCE_NOT_FOUND"
 		}
-	} else {
 		return map[string]any{
-			"error":      "Path must start with 'references/', 'assets/', or 'scripts/'.",
-			"error_code": "INVALID_RESOURCE_PATH",
+			"error":      fmt.Sprintf("Cannot read resource '%s' in skill '%s': %v", args.Path, args.SkillName, err),
+			"error_code": errorCode,
 		}, nil
 	}
-	if !found {
-		return map[string]any{
-			"error":      fmt.Sprintf("Resource '%s' not found in skill '%s'.", args.Path, args.SkillName),
-			"error_code": "RESOURCE_NOT_FOUND",
-		}, nil
+
+	mediaType := mime.TypeByExtension(filepath.Ext(args.Path))
+	if mediaType == "" {
+		mediaType = http.DetectContentType(data)
 	}
-	return map[string]any{
+	result := map[string]any{
 		"skill_name": sk.Name(),
 		"path":       args.Path,
-		"content":    content,
-	}, nil
+		"media_type": mediaType,
+	}
+	if utf8.Valid(data) {
+		result["content"] = string(data)
+		result["encoding"] = "utf-8"
+	} else {
+		result["content"] = base64.StdEncoding.EncodeToString(data)
+		result["encoding"] = "base64"
+	}
+	return result, nil
 }
 
 // loadSkillResourceTool Tool to load resources (references, assets, or scripts) from a skill."""
@@ -255,9 +263,21 @@ func (s *SkillToolset) runSkillScriptToolHandler(ctx tool.Context, args runSkill
 	if strings.HasPrefix(args.ScriptPath, "scripts/") {
 		name = strings.TrimPrefix(args.ScriptPath, "scripts/")
 	}
+	normalizedName := strings.ReplaceAll(strings.TrimSpace(name), "\\", "/")
+	cleanedName := filepath.Clean(filepath.FromSlash(normalizedName))
+	if normalizedName == "" || filepath.IsAbs(normalizedName) || cleanedName == ".." || strings.HasPrefix(cleanedName, ".."+string(filepath.Separator)) {
+		return map[string]any{"error": fmt.Sprintf("Script '%s' is outside the skill scripts directory.", args.ScriptPath), "error_code": "INVALID_SCRIPT_PATH"}, nil
+	}
 
-	if scr, ok := sk.Resources.GetScript(name); !ok || scr == nil {
+	scriptPath, err := sk.ResolveResourcePath(filepath.Join("scripts", cleanedName))
+	if err != nil {
 		return map[string]any{"error": fmt.Sprintf("Script '%s' not found in skill '%s'.", args.ScriptPath, args.SkillName), "error_code": "SCRIPT_NOT_FOUND"}, nil
+	}
+	if s.localRuntime != nil {
+		result := s.localRuntime.runSkillScript(ctx, sk, scriptPath, args.Args)
+		result["skill_name"] = sk.Name()
+		result["script_path"] = args.ScriptPath
+		return result, nil
 	}
 	if s.codeExecutor == nil {
 		return map[string]any{
@@ -269,7 +289,7 @@ func (s *SkillToolset) runSkillScriptToolHandler(ctx tool.Context, args runSkill
 	log.Debugf("runSkillScriptToolHandler args is %s", string(argsStr))
 	codeExecutorResult, err := s.codeExecutor.ExecuteCode(nil, code_executors.CodeExecutionInput{
 		Args:        args.Args,
-		ScriptPath:  filepath.Join(sk.GetSkillPath(), "scripts", name),
+		ScriptPath:  scriptPath,
 		InputFiles:  nil,
 		ExecutionID: ctx.InvocationID(),
 	})

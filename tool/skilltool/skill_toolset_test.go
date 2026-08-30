@@ -1,7 +1,10 @@
 package skilltool
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -168,6 +171,28 @@ func TestLoadSkillResourceTool(t *testing.T) {
 	assert.NoError(t, err)
 	outputMap = result
 	assert.Equal(t, "RESOURCE_NOT_FOUND", outputMap["error_code"])
+}
+
+func TestLoadSkillResourceToolReturnsBinaryAsBase64(t *testing.T) {
+	skillList := createMockSkill(t)
+	binaryPath := filepath.Join(skillList[0].GetSkillPath(), "assets", "template.bin")
+	if err := os.MkdirAll(filepath.Dir(binaryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binaryContent := []byte{0xff, 0x00, 0x01}
+	if err := os.WriteFile(binaryPath, binaryContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	toolset, err := NewSkillToolset(skillList, nil)
+	assert.NoError(t, err)
+	result, err := toolset.loadSkillResourceToolHandler(nil, loadSkillResourceArgs{
+		SkillName: "multiplication-calculator",
+		Path:      "assets/template.bin",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "base64", result["encoding"])
+	assert.Equal(t, base64.StdEncoding.EncodeToString(binaryContent), result["content"])
 }
 
 type mockToolContext struct {

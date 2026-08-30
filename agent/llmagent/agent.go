@@ -17,6 +17,7 @@ package llmagent
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/volcengine/veadk-go/auth/veauth"
 	"github.com/volcengine/veadk-go/common"
@@ -34,14 +35,17 @@ import (
 
 type Config struct {
 	llmagent.Config
-	ModelName        string
-	ModelProvider    string
-	ModelAPIBase     string
-	ModelAPIKey      string
-	ModelExtraConfig map[string]any
-	KnowledgeBase    *knowledgebase.KnowledgeBase
-	PromptManager    prompts.BasePromptManager
-	DisableThought   bool
+	ModelName           string
+	ModelProvider       string
+	ModelAPIBase        string
+	ModelAPIKey         string
+	ModelAPIKeyProvider model.APIKeyProvider
+	ModelExtraConfig    map[string]any
+	ModelExtraHeaders   map[string]string
+	ModelHTTPClient     *http.Client
+	KnowledgeBase       *knowledgebase.KnowledgeBase
+	PromptManager       prompts.BasePromptManager
+	DisableThought      bool
 }
 
 func New(cfg *Config) (agent.Agent, error) {
@@ -76,8 +80,21 @@ func New(cfg *Config) (agent.Agent, error) {
 		if cfg.ModelProvider == "" {
 			cfg.ModelProvider = utils.GetEnvWithDefault(common.MODEL_AGENT_PROVIDER, configs.GetGlobalConfig().Model.Agent.Provider, common.DEFAULT_MODEL_AGENT_PROVIDER)
 		}
-		if cfg.ModelAPIKey == "" {
-			cfg.ModelAPIKey = utils.GetEnvWithDefault(common.MODEL_AGENT_API_KEY, configs.GetGlobalConfig().Model.Agent.ApiKey, utils.Must(veauth.GetArkToken(common.DEFAULT_MODEL_REGION)))
+		if cfg.ModelAPIKey == "" && cfg.ModelAPIKeyProvider == nil {
+			cfg.ModelAPIKey = utils.GetEnvWithDefault(common.MODEL_AGENT_API_KEY, configs.GetGlobalConfig().Model.Agent.ApiKey)
+		}
+		if cfg.ModelAPIKey == "" && cfg.ModelAPIKeyProvider == nil {
+			if cfg.ModelProvider == "ark" {
+				apiKey, tokenErr := veauth.GetArkToken(common.DEFAULT_MODEL_REGION)
+				if tokenErr != nil {
+					return nil, fmt.Errorf("get ARK token: %w", tokenErr)
+				}
+				cfg.ModelAPIKey = apiKey
+			} else {
+				cfg.ModelAPIKeyProvider = veauth.NewArkTokenProvider(veauth.ArkTokenProviderConfig{
+					Region: common.DEFAULT_MODEL_REGION,
+				})
+			}
 		}
 		if cfg.ModelAPIBase == "" {
 			cfg.ModelAPIBase = utils.GetEnvWithDefault(common.MODEL_AGENT_API_BASE, configs.GetGlobalConfig().Model.Agent.ApiBase, common.DEFAULT_MODEL_AGENT_API_BASE)
@@ -101,9 +118,12 @@ func New(cfg *Config) (agent.Agent, error) {
 				context.Background(),
 				cfg.ModelName,
 				&model.ClientConfig{
-					APIKey:    cfg.ModelAPIKey,
-					BaseURL:   cfg.ModelAPIBase,
-					ExtraBody: cfg.ModelExtraConfig,
+					APIKey:         cfg.ModelAPIKey,
+					APIKeyProvider: cfg.ModelAPIKeyProvider,
+					BaseURL:        cfg.ModelAPIBase,
+					ExtraBody:      cfg.ModelExtraConfig,
+					ExtraHeaders:   cfg.ModelExtraHeaders,
+					HTTPClient:     cfg.ModelHTTPClient,
 				})
 		}
 		if err != nil {

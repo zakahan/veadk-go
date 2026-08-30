@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -91,7 +92,7 @@ func parseFrontmatter(text []byte) (*Frontmatter, error) {
 		return nil, fmt.Errorf("skill %s frontmatter is missing name or description. Please check the SKILL.md file", text)
 	}
 
-	log.Infof("Successfully loaded skill frontmatter ,name = %s,description=%s", skillMeta.Name, skillMeta.Description)
+	log.Debugf("Successfully loaded skill frontmatter, name=%s, description=%s", skillMeta.Name, skillMeta.Description)
 	return &skillMeta, nil
 }
 
@@ -168,7 +169,7 @@ func parseSkillMD(skillDir string) (*Skill, error) {
 	skill.Instructions = strings.Join(contextLines, "\n")
 	skill.SkillMDPath = skillMD
 
-	log.Infof("Successfully loaded skill %s locally from %s", skill.Frontmatter.Name, skillDir)
+	log.Debugf("Successfully loaded skill %s locally from %s", skill.Frontmatter.Name, skillDir)
 	return skill, nil
 }
 
@@ -222,4 +223,41 @@ func ReadSkillProperties(skillDir string) (*Frontmatter, error) {
 		return nil, err
 	}
 	return skill.Frontmatter, nil
+}
+
+// DiscoverSkillsFromDir loads only SKILL.md metadata and instructions for each
+// immediate child directory. Large references, assets, and scripts remain on
+// disk and are read on demand by the skill toolset.
+func DiscoverSkillsFromDir(skillsDir string) ([]*Skill, error) {
+	abs, err := filepath.Abs(skillsDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve skills directory: %w", err)
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return nil, fmt.Errorf("read skills directory '%s': %w", skillsDir, err)
+	}
+
+	discovered := make([]*Skill, 0, len(entries))
+	for _, entry := range entries {
+		entryPath := filepath.Join(abs, entry.Name())
+		info, infoErr := os.Stat(entryPath)
+		if infoErr != nil || !info.IsDir() {
+			continue
+		}
+		skill, loadErr := parseSkillMD(entryPath)
+		if loadErr != nil {
+			log.Warnf("Skipping invalid skill directory %s: %v", entryPath, loadErr)
+			continue
+		}
+		if skill.Name() != entry.Name() {
+			log.Warnf("Skipping skill %s: declared name %q does not match directory name", entryPath, skill.Name())
+			continue
+		}
+		discovered = append(discovered, skill)
+	}
+	sort.Slice(discovered, func(i, j int) bool {
+		return discovered[i].Name() < discovered[j].Name()
+	})
+	return discovered, nil
 }

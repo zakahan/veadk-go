@@ -17,6 +17,7 @@ package skills
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -191,6 +192,120 @@ type Skill struct {
 	SkillMDPath  string
 }
 
+func (s *Skill) ResolveResourcePath(resourcePath string) (string, error) {
+	if s == nil || strings.TrimSpace(s.SkillMDPath) == "" {
+		return "", fmt.Errorf("skill path is not configured")
+	}
+
+	normalized := strings.ReplaceAll(strings.TrimSpace(resourcePath), "\\", "/")
+	if normalized == "" {
+		return "", fmt.Errorf("resource path must not be empty")
+	}
+	if filepath.IsAbs(normalized) {
+		return "", fmt.Errorf("resource path must be relative")
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(normalized))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("resource path escapes the skill directory")
+	}
+
+	root, err := filepath.EvalSymlinks(s.GetSkillPath())
+	if err != nil {
+		return "", fmt.Errorf("resolve skill directory: %w", err)
+	}
+	target, err := filepath.EvalSymlinks(filepath.Join(root, cleaned))
+	if err != nil {
+		return "", fmt.Errorf("resolve skill resource: %w", err)
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", fmt.Errorf("validate skill resource: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("resource path escapes the skill directory")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return "", fmt.Errorf("stat skill resource: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("skill resource is not a regular file")
+	}
+	return target, nil
+}
+
+func (s *Skill) ReadResource(resourcePath string, maxBytes int64) ([]byte, error) {
+	if s != nil && strings.TrimSpace(s.SkillMDPath) == "" {
+		return s.readInMemoryResource(resourcePath, maxBytes)
+	}
+	target, err := s.ResolveResourcePath(resourcePath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(target)
+	if err != nil {
+		return nil, fmt.Errorf("open skill resource: %w", err)
+	}
+	defer file.Close()
+
+	if maxBytes <= 0 {
+		return io.ReadAll(file)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read skill resource: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("skill resource exceeds %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
+func (s *Skill) readInMemoryResource(resourcePath string, maxBytes int64) ([]byte, error) {
+	if s == nil || s.Resources == nil {
+		return nil, fmt.Errorf("skill resource is not available: %w", os.ErrNotExist)
+	}
+	normalized := strings.ReplaceAll(strings.TrimSpace(resourcePath), "\\", "/")
+	if normalized == "" || filepath.IsAbs(normalized) {
+		return nil, fmt.Errorf("resource path must be relative")
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(normalized)))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return nil, fmt.Errorf("resource path escapes the skill directory")
+	}
+
+	parts := strings.SplitN(cleaned, "/", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return nil, fmt.Errorf("resource path must start with references/, assets/, or scripts/")
+	}
+	var content string
+	var found bool
+	switch parts[0] {
+	case "references":
+		content, found = s.Resources.GetReference(parts[1])
+	case "assets":
+		content, found = s.Resources.GetAsset(parts[1])
+	case "scripts":
+		var script *Script
+		script, found = s.Resources.GetScript(parts[1])
+		if found && script != nil {
+			content = script.Src
+		} else {
+			found = false
+		}
+	default:
+		return nil, fmt.Errorf("resource path must start with references/, assets/, or scripts/")
+	}
+	if !found {
+		return nil, fmt.Errorf("skill resource %q is not available: %w", resourcePath, os.ErrNotExist)
+	}
+	data := []byte(content)
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("skill resource exceeds %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
 func (s *Skill) Name() string {
 	return s.Frontmatter.Name
 }
@@ -230,6 +345,7 @@ func (s *Skill) WriteSkill(path string) error {
 	}
 
 	if s.Resources == nil {
+		s.SkillMDPath = filepath.Join(skillDir, "SKILL.md")
 		return nil
 	}
 

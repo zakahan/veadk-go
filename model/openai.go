@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -34,11 +35,28 @@ import (
 )
 
 type ClientConfig struct {
-	APIKey     string
-	BaseURL    string
-	ExtraBody  map[string]any
-	HTTPClient *http.Client
+	APIKey         string
+	APIKeyProvider APIKeyProvider
+	BaseURL        string
+	ExtraBody      map[string]any
+	ExtraHeaders   map[string]string
+	HTTPClient     *http.Client
 }
+
+// APIKeyProvider resolves an API key at request time. It allows long-running
+// servers to construct their agents before an STS credential exchange occurs.
+type APIKeyProvider interface {
+	APIKey(ctx context.Context) (string, error)
+}
+
+type apiKeyInvalidator interface {
+	Invalidate()
+}
+
+const (
+	maxAPIErrorBodyBytes = 1 * 1024 * 1024
+	drainResponseBytes   = 64 * 1024
+)
 
 type openAIModel struct {
 	name       string
@@ -55,9 +73,9 @@ func NewOpenAIModel(ctx context.Context, modelName string, config *ClientConfig)
 
 	if config.APIKey == "" {
 		config.APIKey = os.Getenv(common.MODEL_AGENT_API_KEY)
-		if config.APIKey == "" {
-			return nil, fmt.Errorf("openai: API key not found, set MODEL_AGENT_API_KEY environment variable or provide config.APIKey")
-		}
+	}
+	if config.APIKey == "" && config.APIKeyProvider == nil {
+		return nil, fmt.Errorf("openai: API key not found, provide config.APIKey or config.APIKeyProvider")
 	}
 
 	if config.BaseURL == "" {
@@ -585,6 +603,76 @@ func (m *openAIModel) sendRequest(ctx context.Context, openaiReq *openAIRequest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
+	apiKey, err := m.apiKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	httpResp, err := m.sendRequestWithAPIKey(ctx, reqBody, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	if (httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden) && m.config.APIKeyProvider != nil {
+		if invalidator, ok := m.config.APIKeyProvider.(apiKeyInvalidator); ok {
+			drainAndCloseResponse(httpResp)
+			invalidator.Invalidate()
+			apiKey, err = m.apiKey(ctx)
+			if err != nil {
+				return nil, err
+			}
+			httpResp, err = m.sendRequestWithAPIKey(ctx, reqBody, apiKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(httpResp.Body, maxAPIErrorBodyBytes+1))
+		closeErr := httpResp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("API error (status %d): failed to read response body: %w", httpResp.StatusCode, readErr)
+		}
+		truncated := len(body) > maxAPIErrorBodyBytes
+		if truncated {
+			body = body[:maxAPIErrorBodyBytes]
+		}
+		detail := string(body)
+		if truncated {
+			detail += " [truncated]"
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("API error (status %d): %s (close response body: %v)", httpResp.StatusCode, detail, closeErr)
+		}
+		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, detail)
+	}
+
+	return httpResp, nil
+}
+
+func drainAndCloseResponse(response *http.Response) {
+	if response == nil || response.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, drainResponseBytes))
+	_ = response.Body.Close()
+}
+
+func (m *openAIModel) apiKey(ctx context.Context) (string, error) {
+	if m.config.APIKey != "" {
+		return m.config.APIKey, nil
+	}
+	key, err := m.config.APIKeyProvider.APIKey(ctx)
+	if err != nil {
+		return "", fmt.Errorf("openai: failed to resolve API key: %w", err)
+	}
+	if key == "" {
+		return "", errors.New("openai: API key provider returned an empty key")
+	}
+	return key, nil
+}
+
+func (m *openAIModel) sendRequestWithAPIKey(ctx context.Context, reqBody []byte, apiKey string) (*http.Response, error) {
 
 	baseURL := strings.TrimSuffix(m.config.BaseURL, "/")
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/chat/completions", bytes.NewReader(reqBody))
@@ -592,21 +680,15 @@ func (m *openAIModel) sendRequest(ctx context.Context, openaiReq *openAIRequest)
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	for key, value := range m.config.ExtraHeaders {
+		httpReq.Header.Set(key, value)
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+m.config.APIKey)
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	httpResp, err := m.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-
-	if httpResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(httpResp.Body)
-		if err = httpResp.Body.Close(); err != nil {
-			return nil, fmt.Errorf("API failed to close response body: %w", err)
-		}
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(body))
-	}
-
 	return httpResp, nil
 }
 

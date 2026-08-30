@@ -16,7 +16,8 @@ package a2a_app
 
 import (
 	"context"
-	"net/url"
+	"encoding/json"
+	"net/http"
 
 	"github.com/volcengine/veadk-go/log"
 
@@ -31,7 +32,6 @@ import (
 
 const (
 	serverName = "agentkit a2a server"
-	apiPath    = "/"
 )
 
 type agentkitA2AServerApp struct {
@@ -44,10 +44,11 @@ func (a *agentkitA2AServerApp) Run(ctx context.Context, config *apps.RunConfig) 
 }
 
 func (a *agentkitA2AServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
-	publicURL, err := url.JoinPath(a.a2aAgentUrl, apiPath)
-	if err != nil {
-		return err
+	apiPath := a.A2APath
+	if apiPath == "" {
+		apiPath = "/"
 	}
+	publicURL := a.GetA2APublicURL()
 
 	rootAgent := config.AgentLoader.RootAgent()
 	agentCard := &a2acore.AgentCard{
@@ -61,7 +62,16 @@ func (a *agentkitA2AServerApp) SetupRouters(router *mux.Router, config *apps.Run
 		Capabilities:                      a2acore.AgentCapabilities{Streaming: true},
 		SupportsAuthenticatedExtendedCard: false,
 	}
-	router.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(agentCard))
+	cardHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCard := *agentCard
+		requestCard.URL = a.ResolveAgentCardURL(r)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(&requestCard); err != nil {
+			http.Error(w, "failed to encode agent card", http.StatusInternalServerError)
+		}
+	})
+	router.Handle(a2asrv.WellKnownAgentCardPath, cardHandler).Methods(http.MethodGet)
+	router.Handle("/.well-known/agent.json", cardHandler).Methods(http.MethodGet)
 
 	agent := config.AgentLoader.RootAgent()
 	executor := adka2a.NewExecutor(adka2a.ExecutorConfig{
@@ -78,7 +88,7 @@ func (a *agentkitA2AServerApp) SetupRouters(router *mux.Router, config *apps.Run
 	router.Handle(apiPath, a2asrv.NewJSONRPCHandler(reqHandler))
 
 	a2aLauncher := a2a.NewLauncher()
-	a2aLauncher.UserMessage(a.GetWebUrl()+apiPath, log.Println)
+	a2aLauncher.UserMessage(publicURL, log.Println)
 
 	return nil
 }

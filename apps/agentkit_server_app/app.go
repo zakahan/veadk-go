@@ -32,35 +32,84 @@ import (
 
 const serverName = "agentkit server"
 
-type agentkitServerApp struct {
+type AgentkitServerApp struct {
 	*apps.ApiConfig
+	routeSetups []RouteSetup
+	middleware  []mux.MiddlewareFunc
 }
 
-func NewAgentkitServerApp(config *apps.ApiConfig) apps.BasicApp {
-	return &agentkitServerApp{
-		ApiConfig: config,
+type RouteSetup func(router *mux.Router, config *apps.RunConfig) error
+
+type Option func(*AgentkitServerApp)
+
+func WithRouteSetup(setup RouteSetup) Option {
+	return func(app *AgentkitServerApp) {
+		if setup != nil {
+			app.routeSetups = append(app.routeSetups, setup)
+		}
 	}
 }
 
-func (a *agentkitServerApp) Run(ctx context.Context, config *apps.RunConfig) error {
+func WithMiddleware(middleware ...mux.MiddlewareFunc) Option {
+	return func(app *AgentkitServerApp) {
+		app.middleware = append(app.middleware, middleware...)
+	}
+}
+
+func NewAgentkitServerApp(config *apps.ApiConfig, options ...Option) *AgentkitServerApp {
+	if config == nil {
+		config = apps.DefaultApiConfig()
+	}
+	app := &AgentkitServerApp{
+		ApiConfig: config,
+	}
+	for _, option := range options {
+		if option != nil {
+			option(app)
+		}
+	}
+	return app
+}
+
+func (a *AgentkitServerApp) Run(ctx context.Context, config *apps.RunConfig) error {
 	return apps.Run(ctx, config, a)
 }
 
-func (a *agentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
+func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
+	if router == nil {
+		return fmt.Errorf("router is required")
+	}
+	if config == nil || config.AgentLoader == nil || config.AgentLoader.RootAgent() == nil {
+		return fmt.Errorf("agent loader with a root agent is required")
+	}
+	for _, middleware := range a.middleware {
+		if middleware != nil {
+			router.Use(middleware)
+		}
+	}
+
 	var err error
 
 	//setup simple app routers
-	simpleApp := simple_app.NewAgentkitSimpleApp(a.ApiConfig)
-	err = simpleApp.SetupRouters(router, config)
-	if err != nil {
-		return fmt.Errorf("setup simple app routers failed: %w", err)
+	if a.EnableSimpleAPI {
+		simpleApp := simple_app.NewAgentkitSimpleApp(a.ApiConfig)
+		err = simpleApp.SetupRouters(router, config)
+		if err != nil {
+			return fmt.Errorf("setup simple app routers failed: %w", err)
+		}
 	}
 
 	//setup a2a routers
 	a2aApp := a2a_app.NewAgentkitA2AServerApp(a.ApiConfig)
 	err = a2aApp.SetupRouters(router, config)
 	if err != nil {
-		return fmt.Errorf("setup simple app routers failed: %w", err)
+		return fmt.Errorf("setup a2a app routers failed: %w", err)
+	}
+
+	for _, setup := range a.routeSetups {
+		if err = setup(router, config); err != nil {
+			return fmt.Errorf("setup custom routers failed: %w", err)
+		}
 	}
 
 	launchConfig := &launcher.Config{
@@ -73,23 +122,24 @@ func (a *agentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 		TelemetryOptions: config.TelemetryOptions,
 	}
 
-	// setup webui routers
-	webuiLauncher := webui.NewLauncher()
-	_, err = webuiLauncher.Parse([]string{
-		"--api_server_address", a.GetAPIPath(),
-	})
+	if a.EnableWebUI {
+		// setup webui routers
+		webuiLauncher := webui.NewLauncher()
+		_, err = webuiLauncher.Parse([]string{
+			"--api_server_address", a.GetAPIPath(),
+		})
 
-	if err != nil {
-		return fmt.Errorf("webuiLauncher parse parames failed: %w", err)
+		if err != nil {
+			return fmt.Errorf("webuiLauncher parse params failed: %w", err)
+		}
+
+		err = webuiLauncher.SetupSubrouters(router, launchConfig)
+		if err != nil {
+			return fmt.Errorf("setup webui routers failed: %w", err)
+		}
+
+		webuiLauncher.UserMessage(a.GetWebUrl(), log.Println)
 	}
-
-	//webuiLauncher.AddSubrouter(router, w.config.pathPrefix, w.config.backendAddress)
-	err = webuiLauncher.SetupSubrouters(router, launchConfig)
-	if err != nil {
-		return fmt.Errorf("setup webui routers failed: %w", err)
-	}
-
-	webuiLauncher.UserMessage(a.GetWebUrl(), log.Println)
 
 	// setup web api routers
 	// Create the ADK REST API handler
@@ -108,8 +158,10 @@ func (a *agentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	// Wrap it with CORS middleware
 	corsHandler := corsWithArgs(a.GetWebUrl())(apiHandler)
 
-	// Wrap with OpenTelemetry instrumentation first, then add to router
-	wrappedHandler := observability.HTTPMiddleware(http.StripPrefix(a.ApiPathPrefix, corsHandler))
+	var wrappedHandler http.Handler = http.StripPrefix(a.ApiPathPrefix, corsHandler)
+	if !config.DisableObservability {
+		wrappedHandler = observability.HTTPMiddleware(wrappedHandler)
+	}
 	router.Methods("GET", "POST", "DELETE", "OPTIONS").PathPrefix(fmt.Sprintf("%s/", a.ApiPathPrefix)).Handler(wrappedHandler)
 
 	log.Infof("       api:  you can access API using %s", a.GetAPIPath())
@@ -118,11 +170,11 @@ func (a *agentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	return nil
 }
 
-func (a *agentkitServerApp) GetApiConfig() *apps.ApiConfig {
+func (a *AgentkitServerApp) GetApiConfig() *apps.ApiConfig {
 	return a.ApiConfig
 }
 
-func (a *agentkitServerApp) GetServerName() string {
+func (a *AgentkitServerApp) GetServerName() string {
 	return serverName
 }
 
