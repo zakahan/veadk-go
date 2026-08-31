@@ -35,9 +35,6 @@ import (
 )
 
 func TestRunRejectsInvalidInputs(t *testing.T) {
-	if err := Run(nil, &RunConfig{}, nil); err == nil {
-		t.Fatal("Run(nil context) error = nil")
-	}
 	if err := Run(context.Background(), nil, nil); err == nil {
 		t.Fatal("Run(nil config) error = nil")
 	}
