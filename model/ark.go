@@ -18,10 +18,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/volcengine/volcengine-go-sdk/service/arkruntime"
@@ -33,22 +36,30 @@ import (
 
 // ArkClientConfig holds configuration for the ARK SDK-based model.
 type ArkClientConfig struct {
-	APIKey    string
-	AK        string // Volcengine Access Key (alternative to APIKey)
-	SK        string // Volcengine Secret Key (alternative to APIKey)
-	BaseURL   string
-	Region    string
-	ExtraBody map[string]any
+	APIKey         string
+	APIKeyProvider APIKeyProvider
+	AK             string // Volcengine Access Key (alternative to APIKey)
+	SK             string // Volcengine Secret Key (alternative to APIKey)
+	BaseURL        string
+	Region         string
+	ExtraBody      map[string]any
+	ExtraHeaders   map[string]string
+	HTTPClient     *http.Client
 }
 
 type arkModel struct {
-	name   string
-	config *ArkClientConfig
-	client *arkruntime.Client
+	name           string
+	config         *ArkClientConfig
+	apiKeyProvider APIKeyProvider
+
+	clientMu  sync.Mutex
+	clientKey string
+	client    *arkruntime.Client
 }
 
 // NewArkModel creates an LLM backed by the Volcengine ARK SDK.
-// Auth is resolved as: APIKey > AK/SK. At least one must be provided.
+// Auth is resolved as: APIKey > AK/SK > APIKeyProvider. A provider is resolved
+// only when GenerateContent sends its first request.
 func NewArkModel(ctx context.Context, modelName string, config *ArkClientConfig) (model.LLM, error) {
 	_ = ctx
 
@@ -56,6 +67,28 @@ func NewArkModel(ctx context.Context, modelName string, config *ArkClientConfig)
 		config = &ArkClientConfig{}
 	}
 
+	var client *arkruntime.Client
+	var apiKeyProvider APIKeyProvider
+	switch {
+	case config.APIKey != "":
+		client = arkruntime.NewClientWithApiKey(config.APIKey, arkClientOptions(config)...)
+	case config.AK != "" && config.SK != "":
+		client = arkruntime.NewClientWithAkSk(config.AK, config.SK, arkClientOptions(config)...)
+	case config.APIKeyProvider != nil:
+		apiKeyProvider = config.APIKeyProvider
+	default:
+		return nil, fmt.Errorf("ark: API key or AK/SK pair is required unless API key provider is configured")
+	}
+
+	return &arkModel{
+		name:           modelName,
+		config:         config,
+		apiKeyProvider: apiKeyProvider,
+		client:         client,
+	}, nil
+}
+
+func arkClientOptions(config *ArkClientConfig) []arkruntime.ConfigOption {
 	var opts []arkruntime.ConfigOption
 	if config.BaseURL != "" {
 		opts = append(opts, arkruntime.WithBaseUrl(config.BaseURL))
@@ -63,26 +96,57 @@ func NewArkModel(ctx context.Context, modelName string, config *ArkClientConfig)
 	if config.Region != "" {
 		opts = append(opts, arkruntime.WithRegion(config.Region))
 	}
-
-	var client *arkruntime.Client
-	switch {
-	case config.APIKey != "":
-		client = arkruntime.NewClientWithApiKey(config.APIKey, opts...)
-	case config.AK != "" && config.SK != "":
-		client = arkruntime.NewClientWithAkSk(config.AK, config.SK, opts...)
-	default:
-		return nil, fmt.Errorf("ark: API key or AK/SK pair is required")
+	if config.HTTPClient != nil {
+		opts = append(opts, arkruntime.WithHTTPClient(config.HTTPClient))
 	}
-
-	return &arkModel{
-		name:   modelName,
-		config: config,
-		client: client,
-	}, nil
+	return opts
 }
 
 func (m *arkModel) Name() string {
 	return m.name
+}
+
+func (m *arkModel) clientForRequest(ctx context.Context) (*arkruntime.Client, string, error) {
+	if m.apiKeyProvider == nil {
+		return m.client, "", nil
+	}
+
+	key, err := m.apiKeyProvider.APIKey(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("ark: resolve API key: %w", err)
+	}
+	if strings.TrimSpace(key) == "" {
+		return nil, "", errors.New("ark: API key provider returned an empty key")
+	}
+
+	m.clientMu.Lock()
+	defer m.clientMu.Unlock()
+	if m.client == nil || m.clientKey != key {
+		m.client = arkruntime.NewClientWithApiKey(key, arkClientOptions(m.config)...)
+		m.clientKey = key
+	}
+	return m.client, key, nil
+}
+
+func (m *arkModel) invalidateClient(key string) {
+	if invalidator, ok := m.apiKeyProvider.(APIKeyInvalidator); ok {
+		invalidator.Invalidate()
+	}
+	m.clientMu.Lock()
+	if m.clientKey == key {
+		m.client = nil
+		m.clientKey = ""
+	}
+	m.clientMu.Unlock()
+}
+
+func isArkAuthError(err error) bool {
+	var apiErr *arkmodel.APIError
+	if errors.As(err, &apiErr) {
+		return isAuthStatus(apiErr.HTTPStatusCode)
+	}
+	var requestErr *arkmodel.RequestError
+	return errors.As(err, &requestErr) && isAuthStatus(requestErr.HTTPStatusCode)
 }
 
 func (m *arkModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
@@ -318,7 +382,20 @@ func newArkStringContent(s string) *arkmodel.ChatCompletionMessageContent {
 // generate handles non-streaming chat completion.
 func (m *arkModel) generate(ctx context.Context, arkReq *arkmodel.CreateChatCompletionRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		resp, err := m.client.CreateChatCompletion(ctx, *arkReq)
+		client, key, err := m.clientForRequest(ctx)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		resp, err := client.CreateChatCompletion(ctx, *arkReq, arkruntime.WithCustomHeaders(m.config.ExtraHeaders))
+		_, canInvalidate := m.apiKeyProvider.(APIKeyInvalidator)
+		if err != nil && canInvalidate && isArkAuthError(err) {
+			m.invalidateClient(key)
+			client, _, err = m.clientForRequest(ctx)
+			if err == nil {
+				resp, err = client.CreateChatCompletion(ctx, *arkReq, arkruntime.WithCustomHeaders(m.config.ExtraHeaders))
+			}
+		}
 		if err != nil {
 			yield(nil, fmt.Errorf("ark: chat completion failed: %w", err))
 			return
@@ -336,7 +413,20 @@ func (m *arkModel) generate(ctx context.Context, arkReq *arkmodel.CreateChatComp
 // generateStream handles streaming chat completion.
 func (m *arkModel) generateStream(ctx context.Context, arkReq *arkmodel.CreateChatCompletionRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		stream, err := m.client.CreateChatCompletionStream(ctx, *arkReq)
+		client, key, err := m.clientForRequest(ctx)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		stream, err := client.CreateChatCompletionStream(ctx, *arkReq, arkruntime.WithCustomHeaders(m.config.ExtraHeaders))
+		_, canInvalidate := m.apiKeyProvider.(APIKeyInvalidator)
+		if err != nil && canInvalidate && isArkAuthError(err) {
+			m.invalidateClient(key)
+			client, _, err = m.clientForRequest(ctx)
+			if err == nil {
+				stream, err = client.CreateChatCompletionStream(ctx, *arkReq, arkruntime.WithCustomHeaders(m.config.ExtraHeaders))
+			}
+		}
 		if err != nil {
 			yield(nil, fmt.Errorf("ark: stream creation failed: %w", err))
 			return

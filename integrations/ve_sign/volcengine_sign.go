@@ -16,6 +16,7 @@ package ve_sign
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,11 +33,21 @@ import (
 )
 
 const (
-	HttpsSchema = "https"
-	HttpSchema  = "http"
+	HttpsSchema            = "https"
+	HttpSchema             = "http"
+	maxVeResponseBodyBytes = 4 * 1024 * 1024
 )
 
 var ErrVeRequestParam = errors.New("VeRequest Param Invalid Error")
+
+// HTTPError reports a non-success response from a signed Volcengine request.
+type HTTPError struct {
+	StatusCode int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("request failed with status %d", e.StatusCode)
+}
 
 type VeRequest struct {
 	AK      string
@@ -84,6 +95,10 @@ func (vr VeRequest) validate() error {
 }
 
 func (vr VeRequest) buildSignRequest() (*http.Request, error) {
+	return vr.buildSignRequestWithContext(context.Background())
+}
+
+func (vr VeRequest) buildSignRequestWithContext(ctx context.Context) (*http.Request, error) {
 	if vr.Scheme != HttpsSchema && vr.Scheme != HttpSchema {
 		vr.Scheme = HttpsSchema
 	}
@@ -104,7 +119,7 @@ func (vr VeRequest) buildSignRequest() (*http.Request, error) {
 	requestAddr := fmt.Sprintf("%s://%s%s?%s", vr.Scheme, vr.Host, vr.Path, queries.Encode())
 	bodyBytes, _ := json.Marshal(vr.Body)
 
-	request, err := http.NewRequest(vr.Method, requestAddr, bytes.NewBuffer(bodyBytes))
+	request, err := http.NewRequestWithContext(ctx, vr.Method, requestAddr, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("VeRequest.v2 NewRequest bad request: %w", err)
 	}
@@ -165,13 +180,23 @@ func (vr VeRequest) buildSignRequest() (*http.Request, error) {
 }
 
 func (vr VeRequest) DoRequest() ([]byte, error) {
-	req, err := vr.buildSignRequest()
+	return vr.DoRequestWithContext(context.Background(), nil)
+}
+
+// DoRequestWithContext signs and sends the request with the provided context
+// and HTTP client. A nil client preserves the existing Timeout/default-client
+// behavior.
+func (vr VeRequest) DoRequestWithContext(ctx context.Context, httpClient *http.Client) ([]byte, error) {
+	req, err := vr.buildSignRequestWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var client = http.DefaultClient
-	if vr.Timeout > 0 {
-		client = &http.Client{Timeout: time.Duration(vr.Timeout) * time.Second}
+	client := httpClient
+	if client == nil {
+		client = http.DefaultClient
+		if vr.Timeout > 0 {
+			client = &http.Client{Timeout: time.Duration(vr.Timeout) * time.Second}
+		}
 	}
 
 	resp, err := client.Do(req)
@@ -182,13 +207,16 @@ func (vr VeRequest) DoRequest() ([]byte, error) {
 		_ = resp.Body.Close()
 	}()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxVeResponseBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
+	if len(respBody) > maxVeResponseBodyBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxVeResponseBodyBytes)
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		return respBody, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(respBody))
+		return respBody, &HTTPError{StatusCode: resp.StatusCode}
 	}
 	return respBody, nil
 }
