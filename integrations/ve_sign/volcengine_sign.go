@@ -94,10 +94,6 @@ func (vr VeRequest) validate() error {
 	return nil
 }
 
-func (vr VeRequest) buildSignRequest() (*http.Request, error) {
-	return vr.buildSignRequestWithContext(context.Background())
-}
-
 func (vr VeRequest) buildSignRequestWithContext(ctx context.Context) (*http.Request, error) {
 	if vr.Scheme != HttpsSchema && vr.Scheme != HttpSchema {
 		vr.Scheme = HttpsSchema

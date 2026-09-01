@@ -26,7 +26,7 @@ import (
 func TestVikingMemoryClient_CollectionCreate(t *testing.T) {
 	mockey.PatchConvey("TestVikingMemoryClient_CollectionCreate", t, func() {
 		mockey.Mock(ve_viking.NewConfig).Return(&ve_viking.ClientConfig{}, nil).Build()
-		mockey.Mock(ve_sign.VeRequest.DoRequest).Return([]byte(`{"code": 0}`), nil).Build()
+		mockey.Mock(ve_sign.VeRequest.DoRequestWithContext).Return([]byte(`{"code": 0}`), nil).Build()
 
 		client, err := New(&ve_viking.ClientConfig{Index: "test"})
 		assert.Nil(t, err)
@@ -40,7 +40,7 @@ func TestVikingMemoryClient_CollectionCreate(t *testing.T) {
 func TestVikingMemoryClient_CollectionInfo(t *testing.T) {
 	mockey.PatchConvey("TestVikingMemoryClient_CollectionInfo", t, func() {
 		mockey.Mock(ve_viking.NewConfig).Return(&ve_viking.ClientConfig{}, nil).Build()
-		mockey.Mock(ve_sign.VeRequest.DoRequest).Return([]byte(`{"code": 0}`), nil).Build()
+		mockey.Mock(ve_sign.VeRequest.DoRequestWithContext).Return([]byte(`{"code": 0}`), nil).Build()
 		client, err := New(&ve_viking.ClientConfig{Index: "test"})
 		assert.Nil(t, err)
 		err = client.CollectionInfo()
@@ -51,7 +51,7 @@ func TestVikingMemoryClient_CollectionInfo(t *testing.T) {
 func TestVikingMemoryClient_CollectionSearchMemory(t *testing.T) {
 	mockey.PatchConvey("TestVikingMemoryClient_CollectionSearchMemory", t, func() {
 		mockey.Mock(ve_viking.NewConfig).Return(&ve_viking.ClientConfig{}, nil).Build()
-		mockey.Mock(ve_sign.VeRequest.DoRequest).Return([]byte(`{"code": 0, "data": {"result_list": [{"memory_info":{"summary":"test"}}]}}`), nil).Build()
+		mockey.Mock(ve_sign.VeRequest.DoRequestWithContext).Return([]byte(`{"code": 0, "data": {"result_list": [{"memory_info":{"summary":"test"}}]}}`), nil).Build()
 		client, err := New(&ve_viking.ClientConfig{Index: "test"})
 		assert.Nil(t, err)
 
@@ -64,7 +64,7 @@ func TestVikingMemoryClient_CollectionSearchMemory(t *testing.T) {
 
 func TestVikingMemoryClient_AddSession(t *testing.T) {
 	mockey.PatchConvey("TestVikingMemoryClient_AddSession", t, func() {
-		mockey.Mock(ve_sign.VeRequest.DoRequest).Return([]byte(`{"code": 0}`), nil).Build()
+		mockey.Mock(ve_sign.VeRequest.DoRequestWithContext).Return([]byte(`{"code": 0}`), nil).Build()
 		mockey.Mock(ve_viking.NewConfig).Return(&ve_viking.ClientConfig{}, nil).Build()
 
 		client, err := New(&ve_viking.ClientConfig{Index: "test"})

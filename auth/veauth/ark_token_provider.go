@@ -196,7 +196,7 @@ func isRetryableArkTokenError(err error) bool {
 		return responseErr.StatusCode == http.StatusTooManyRequests || responseErr.StatusCode >= http.StatusInternalServerError
 	}
 	var networkErr net.Error
-	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
+	return errors.As(err, &networkErr) && networkErr.Timeout()
 }
 
 func (p *ArkTokenProvider) fetch(ctx context.Context) (string, error) {
