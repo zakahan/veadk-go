@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"os"
 
 	"github.com/volcengine/veadk-go/agent/remoteagent"
 	"github.com/volcengine/veadk-go/apps"
@@ -25,20 +27,27 @@ import (
 )
 
 func main() {
+	remoteURL := flag.String("remote-url", "http://127.0.0.1:8000", "remote A2A server base URL")
+	host := flag.String("host", "127.0.0.1", "HTTP listen host")
+	port := flag.Int("port", 8001, "HTTP listen port")
+	flag.Parse()
+
 	ctx := context.Background()
 
 	remoteAgent, err := remoteagent.NewVeRemoteAgent(
 		remoteagent.NewDefaultConfig().
 			SetName("remoteAgent").
-			SetApiKey("your api key").
-			SetBaseUrl("you base url"),
+			SetApiKey(os.Getenv("REMOTE_AGENT_API_KEY")).
+			SetBaseUrl(*remoteURL),
 	)
 	if err != nil {
 		log.Errorf("Failed to create a remote agent: %v", err)
 		return
 	}
 
-	app := agentkit_server_app.NewAgentkitServerApp(apps.DefaultApiConfig())
+	app := agentkit_server_app.NewAgentkitServerApp(
+		apps.DefaultApiConfig().SetHost(*host).SetPort(*port),
+	)
 
 	err = app.Run(ctx, &apps.RunConfig{
 		AgentLoader: agent.NewSingleLoader(remoteAgent),
