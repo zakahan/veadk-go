@@ -99,6 +99,62 @@ func TestAPIConfigAddressesAndFlags(t *testing.T) {
 	}
 }
 
+func TestAPIConfigA2ARoutingAndAgentCardURL(t *testing.T) {
+	config := DefaultApiConfig().
+		SetHost("127.0.0.1").
+		SetPort(8024).
+		SetPublicURL("https://public.example/sandbox/").
+		SetA2APath("internal/a2a/").
+		SetA2APublicPath("public/a2a/")
+
+	if got, want := config.GetWebUrl(), "http://127.0.0.1:8024"; got != want {
+		t.Fatalf("GetWebUrl() = %q, want %q", got, want)
+	}
+	if got, want := config.GetA2APath(), "/internal/a2a"; got != want {
+		t.Fatalf("GetA2APath() = %q, want %q", got, want)
+	}
+	if got, want := config.GetA2APublicURL(), "https://public.example/sandbox/public/a2a"; got != want {
+		t.Fatalf("GetA2APublicURL() = %q, want %q", got, want)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://attacker.invalid/.well-known/agent-card.json", nil)
+	request.Host = "attacker.invalid"
+	request.Header.Set("Forwarded", `for=192.0.2.1;proto=http;host="attacker.invalid"`)
+	request.Header.Set("X-Forwarded-Proto", "http")
+	request.Header.Set("X-Forwarded-Host", "attacker.invalid")
+	if got, want := config.ResolveAgentCardURL(request), "https://public.example/sandbox/public/a2a"; got != want {
+		t.Fatalf("default ResolveAgentCardURL() = %q, want configured URL %q", got, want)
+	}
+	staticConfig := DefaultApiConfig().SetHost("127.0.0.1").SetPort(8024).SetA2APath("/a2a")
+	if got, want := staticConfig.ResolveAgentCardURL(request), "http://127.0.0.1:8024/a2a"; got != want {
+		t.Fatalf("default resolver without PublicURL = %q, want listener-derived URL %q", got, want)
+	}
+
+	config.SetAgentCardURLResolver(ForwardedAgentCardURL)
+	request.Header.Set("Forwarded", `for=192.0.2.1;proto=https;host="proxy.example:8443"`)
+	if got, want := config.ResolveAgentCardURL(request), "https://proxy.example:8443/public/a2a"; got != want {
+		t.Fatalf("forwarded ResolveAgentCardURL() = %q, want %q", got, want)
+	}
+
+	request.Header.Set("Forwarded", "")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-Host", "legacy-proxy.example")
+	if got, want := config.ResolveAgentCardURL(request), "https://legacy-proxy.example/public/a2a"; got != want {
+		t.Fatalf("X-Forwarded ResolveAgentCardURL() = %q, want %q", got, want)
+	}
+
+	request.Host = "bad host"
+	request.Header.Set("X-Forwarded-Host", "user@example.invalid")
+	if got, want := config.ResolveAgentCardURL(request), config.GetA2APublicURL(); got != want {
+		t.Fatalf("invalid forwarded host resolved to %q, want fallback %q", got, want)
+	}
+
+	config.SetA2APublicPath("")
+	if got, want := config.GetA2APublicURL(), "https://public.example/sandbox/internal/a2a"; got != want {
+		t.Fatalf("inherited A2A public URL = %q, want %q", got, want)
+	}
+}
+
 type lifecycleTestApp struct {
 	config *ApiConfig
 	setup  func(*mux.Router) error
@@ -338,6 +394,15 @@ func TestRunRedactsSetupAndConfigurationErrors(t *testing.T) {
 	err = invalid.Run(context.Background(), &RunConfig{DisableObservability: true})
 	if err == nil || err.Error() != "validate server configuration failed" {
 		t.Fatalf("invalid CORS error = %v", err)
+	}
+
+	invalidPublicURL := &lifecycleTestApp{config: DefaultApiConfig().SetPublicURL("https://user:secret@example.test/a2a")}
+	err = invalidPublicURL.Run(context.Background(), &RunConfig{DisableObservability: true})
+	if err == nil || err.Error() != "validate server configuration failed" {
+		t.Fatalf("invalid public URL error = %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("invalid public URL error leaked user info: %v", err)
 	}
 }
 

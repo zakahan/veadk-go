@@ -16,7 +16,9 @@ package a2a_app
 
 import (
 	"context"
-	"net/url"
+	"encoding/json"
+	"errors"
+	"net/http"
 
 	"github.com/volcengine/veadk-go/log"
 
@@ -30,13 +32,12 @@ import (
 )
 
 const (
-	serverName = "agentkit a2a server"
-	apiPath    = "/"
+	serverName          = "agentkit a2a server"
+	legacyAgentCardPath = "/.well-known/agent.json"
 )
 
 type agentkitA2AServerApp struct {
 	*apps.ApiConfig
-	a2aAgentUrl string
 }
 
 func (a *agentkitA2AServerApp) Run(ctx context.Context, config *apps.RunConfig) error {
@@ -44,24 +45,34 @@ func (a *agentkitA2AServerApp) Run(ctx context.Context, config *apps.RunConfig) 
 }
 
 func (a *agentkitA2AServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
-	publicURL, err := url.JoinPath(a.a2aAgentUrl, apiPath)
-	if err != nil {
-		return err
+	if router == nil {
+		return errors.New("router is required")
 	}
-
+	if config == nil || config.AgentLoader == nil || config.AgentLoader.RootAgent() == nil {
+		return errors.New("agent loader with a root agent is required")
+	}
 	rootAgent := config.AgentLoader.RootAgent()
 	agentCard := &a2acore.AgentCard{
 		Name:                              rootAgent.Name(),
 		Description:                       rootAgent.Description(),
 		DefaultInputModes:                 []string{"text/plain"},
 		DefaultOutputModes:                []string{"text/plain"},
-		URL:                               publicURL,
+		URL:                               a.GetA2APublicURL(),
 		PreferredTransport:                a2acore.TransportProtocolJSONRPC,
 		Skills:                            adka2a.BuildAgentSkills(rootAgent),
 		Capabilities:                      a2acore.AgentCapabilities{Streaming: true},
 		SupportsAuthenticatedExtendedCard: false,
 	}
-	router.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(agentCard))
+	cardHandler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCard := *agentCard
+		requestCard.URL = a.ResolveAgentCardURL(request)
+		writer.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(writer).Encode(&requestCard); err != nil {
+			log.Errorf("failed to encode A2A Agent Card")
+		}
+	})
+	router.Handle(a2asrv.WellKnownAgentCardPath, cardHandler).Methods(http.MethodGet)
+	router.Handle(legacyAgentCardPath, cardHandler).Methods(http.MethodGet)
 
 	agent := config.AgentLoader.RootAgent()
 	executor := adka2a.NewExecutor(adka2a.ExecutorConfig{
@@ -75,10 +86,10 @@ func (a *agentkitA2AServerApp) SetupRouters(router *mux.Router, config *apps.Run
 		},
 	})
 	reqHandler := a2asrv.NewHandler(executor, config.A2AOptions...)
-	router.Handle(apiPath, a2asrv.NewJSONRPCHandler(reqHandler))
+	router.Handle(a.GetA2APath(), a2asrv.NewJSONRPCHandler(reqHandler)).Methods(http.MethodPost)
 
 	a2aLauncher := a2a.NewLauncher()
-	a2aLauncher.UserMessage(a.GetWebUrl()+apiPath, log.Println)
+	a2aLauncher.UserMessage(a.GetA2APublicURL(), log.Println)
 
 	return nil
 }
@@ -92,8 +103,10 @@ func (a *agentkitA2AServerApp) GetServerName() string {
 }
 
 func NewAgentkitA2AServerApp(config *apps.ApiConfig) apps.BasicApp {
+	if config == nil {
+		config = apps.DefaultApiConfig()
+	}
 	return &agentkitA2AServerApp{
-		ApiConfig:   config,
-		a2aAgentUrl: config.GetWebUrl(),
+		ApiConfig: config,
 	}
 }
