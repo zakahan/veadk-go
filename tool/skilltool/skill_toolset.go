@@ -39,7 +39,7 @@ import (
 )
 
 const MAX_SKILL_PAYLOAD_BYTES = skills.DefaultMaxResourceBytes
-const DEFAULT_SKILL_SYSTEM_INSTRUCTION = "" +
+const defaultReadOnlySkillSystemInstruction = "" +
 	"You can use specialized 'skills' to help you with complex tasks. You MUST use the skill tools to interact with these skills.\n\n" +
 	"Skills are folders of instructions and resources that extend your capabilities for specialized tasks. Each skill folder contains:\n" +
 	"- **SKILL.md** (required): The main instruction file with skill metadata and detailed markdown instructions.\n" +
@@ -49,7 +49,9 @@ const DEFAULT_SKILL_SYSTEM_INSTRUCTION = "" +
 	"This is very important:\n\n" +
 	"1. If a skill seems relevant to the current user query, you MUST use the `load_skill` tool with `name=\"<SKILL_NAME>\"` to read its full instructions before proceeding.\n" +
 	"2. Once you have read the instructions, follow them exactly as documented before replying to the user. For example, If the instruction lists multiple steps, please make sure you complete all of them in order.\n" +
-	"3. The `load_skill_resource` tool is for viewing relative files within a skill's directory (e.g., `references/*`, `assets/*`, `scripts/*`, or files referenced beside SKILL.md). Do NOT use other tools to access these files.\n" +
+	"3. The `load_skill_resource` tool is for viewing relative files within a skill's directory (e.g., `references/*`, `assets/*`, `scripts/*`, or files referenced beside SKILL.md). Do NOT use other tools to access these files.\n"
+
+const DEFAULT_SKILL_SYSTEM_INSTRUCTION = defaultReadOnlySkillSystemInstruction +
 	"4. Use `run_skill_script` to run scripts from a skill's `scripts/` directory. Use `load_skill_resource` to view script content first if needed.\n"
 
 // SkillToolset A toolset for managing and interacting with agent skills.
@@ -57,9 +59,21 @@ type SkillToolset struct {
 	skills       map[string]*skills.Skill
 	tools        []tool.Tool
 	codeExecutor code_executors.CodeExecutor
+	instruction  string
 }
 
 func NewSkillToolset(skillList []*skills.Skill, codeExecutor code_executors.CodeExecutor) (*SkillToolset, error) {
+	return newSkillToolset(skillList, codeExecutor, true)
+}
+
+// NewReadOnlySkillToolset creates a toolset for discovered local skills. It
+// exposes metadata and lazy resource reads, but deliberately does not expose
+// script execution.
+func NewReadOnlySkillToolset(skillList []*skills.Skill) (*SkillToolset, error) {
+	return newSkillToolset(skillList, nil, false)
+}
+
+func newSkillToolset(skillList []*skills.Skill, codeExecutor code_executors.CodeExecutor, includeScriptTool bool) (*SkillToolset, error) {
 	m := make(map[string]*skills.Skill, len(skillList))
 	for _, s := range skillList {
 		if s == nil || s.Frontmatter == nil {
@@ -73,12 +87,16 @@ func NewSkillToolset(skillList []*skills.Skill, codeExecutor code_executors.Code
 	st := &SkillToolset{
 		skills:       m,
 		codeExecutor: codeExecutor,
+		instruction:  defaultReadOnlySkillSystemInstruction,
 	}
 	st.tools = []tool.Tool{
 		st.listSkillsTool(),
 		st.loadSkillTool(),
 		st.loadSkillResourceTool(),
-		st.runSkillScriptTool(),
+	}
+	if includeScriptTool {
+		st.tools = append(st.tools, st.runSkillScriptTool())
+		st.instruction = DEFAULT_SKILL_SYSTEM_INSTRUCTION
 	}
 	return st, nil
 }
@@ -98,7 +116,7 @@ func (s *SkillToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 func (s *SkillToolset) ProcessRequest(ctx tool.Context, req *model.LLMRequest) error {
 	skillList := s.listSkills()
 	skillXML := skills.FormatSkillsAsXML(skillList)
-	instruction := []string{DEFAULT_SKILL_SYSTEM_INSTRUCTION, skillXML}
+	instruction := []string{s.instruction, skillXML}
 	if req.Config.SystemInstruction == nil {
 		req.Config.SystemInstruction = &genai.Content{
 			Parts: []*genai.Part{

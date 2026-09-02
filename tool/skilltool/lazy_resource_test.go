@@ -120,6 +120,33 @@ func TestNewSkillToolsetRejectsNilAndDuplicateSkills(t *testing.T) {
 	}
 }
 
+func TestNewReadOnlySkillToolsetOmitsScriptExecution(t *testing.T) {
+	root := t.TempDir()
+	writeLazySkillFile(t, filepath.Join(root, "lazy-skill", "SKILL.md"), "---\nname: lazy-skill\ndescription: lazy resources\n---\ninstructions\n")
+	discovered, err := skills.DiscoverSkillsFromDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolset, err := NewReadOnlySkillToolset(discovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, err := toolset.Tools(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, skillTool := range tools {
+		names = append(names, skillTool.Name())
+	}
+	if got, want := strings.Join(names, ","), "list_skills,load_skill,load_skill_resource"; got != want {
+		t.Fatalf("read-only tools = %q, want %q", got, want)
+	}
+	if strings.Contains(toolset.instruction, "run_skill_script") {
+		t.Fatal("read-only instruction advertises run_skill_script")
+	}
+}
+
 func writeLazySkillFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
