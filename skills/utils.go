@@ -15,7 +15,6 @@
 package skills
 
 import (
-	"bufio"
 	"fmt"
 	"io/fs"
 	"os"
@@ -84,92 +83,15 @@ func parseFrontmatter(text []byte) (*Frontmatter, error) {
 	var skillMeta Frontmatter
 
 	if err := yaml.Unmarshal(text, &skillMeta); err != nil {
-		return nil, fmt.Errorf("failed to parse frontmatter {%s} error: %v", text, err)
+		return nil, fmt.Errorf("invalid YAML: %w", err)
 	}
 
 	if skillMeta.Name == "" || skillMeta.Description == "" {
-		return nil, fmt.Errorf("skill %s frontmatter is missing name or description. Please check the SKILL.md file", text)
+		return nil, fmt.Errorf("frontmatter is missing name or description")
 	}
 
-	log.Infof("Successfully loaded skill frontmatter ,name = %s,description=%s", skillMeta.Name, skillMeta.Description)
+	log.Debugf("Successfully loaded skill frontmatter, name=%s", skillMeta.Name)
 	return &skillMeta, nil
-}
-
-func parseSkillMD(skillDir string) (*Skill, error) {
-	var skill = &Skill{}
-	info, err := os.Stat(skillDir)
-	if err != nil {
-		return skill, fmt.Errorf("skill directory '%s' stat error:%w", skillDir, err)
-	}
-	if !info.IsDir() {
-		return skill, fmt.Errorf("skill directory '%s' is not a directory", skillDir)
-	}
-
-	var skillMD string
-	for _, name := range []string{"SKILL.md", "skill.md"} {
-		p := filepath.Join(skillDir, name)
-		if _, err := os.Stat(p); err == nil {
-			skillMD = p
-			break
-		}
-	}
-	if skillMD == "" {
-		return skill, fmt.Errorf("SKILL.md not found in '%s'", skillDir)
-	}
-
-	file, err := os.Open(skillMD)
-	if err != nil {
-		return skill, fmt.Errorf("open skill file '%s' error:%w", skillMD, err)
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-	sc := bufio.NewScanner(file)
-	if !sc.Scan() {
-		return skill, err
-	}
-
-	if strings.TrimSpace(sc.Text()) != "---" {
-		return skill, fmt.Errorf("failed to parse %s, invalid frontmatter", skillMD)
-	}
-
-	var frontmatterLines []string
-	var contextLines []string
-	var isFrontmatterLines = true
-
-	for sc.Scan() {
-		line := sc.Text()
-		if isFrontmatterLines && strings.TrimSpace(line) == "---" {
-			if len(frontmatterLines) == 0 {
-				return nil, fmt.Errorf("failed to parse %s, empty frontmatter", skillMD)
-			}
-			isFrontmatterLines = false
-			frontmatterStr := strings.Join(frontmatterLines, "\n")
-			skill.Frontmatter, err = parseFrontmatter([]byte(frontmatterStr))
-			if err != nil {
-				return skill, fmt.Errorf("failed to parse frontmatter '%s', %w", skillMD, err)
-			}
-			if err := skill.Frontmatter.Validate(); err != nil {
-				return skill, fmt.Errorf("skill %s frontmatter invalid :%w", skillDir, err)
-			}
-			continue
-		}
-		if isFrontmatterLines {
-			frontmatterLines = append(frontmatterLines, line)
-		} else {
-			contextLines = append(contextLines, line)
-		}
-	}
-
-	if isFrontmatterLines {
-		return skill, fmt.Errorf("failed to parse %s, missing closing frontmatter separator", skillMD)
-	}
-
-	skill.Instructions = strings.Join(contextLines, "\n")
-	skill.SkillMDPath = skillMD
-
-	log.Infof("Successfully loaded skill %s locally from %s", skill.Frontmatter.Name, skillDir)
-	return skill, nil
 }
 
 func LoadSkillFromDir(skillDir string) (*Skill, error) {

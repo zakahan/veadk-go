@@ -15,11 +15,18 @@
 package skilltool
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/volcengine/veadk-go/code_executors"
 	"github.com/volcengine/veadk-go/log"
@@ -31,7 +38,7 @@ import (
 	"google.golang.org/genai"
 )
 
-const MAX_SKILL_PAYLOAD_BYTES = 16 * 1024 * 1024 // 16 MB
+const MAX_SKILL_PAYLOAD_BYTES = skills.DefaultMaxResourceBytes
 const DEFAULT_SKILL_SYSTEM_INSTRUCTION = "" +
 	"You can use specialized 'skills' to help you with complex tasks. You MUST use the skill tools to interact with these skills.\n\n" +
 	"Skills are folders of instructions and resources that extend your capabilities for specialized tasks. Each skill folder contains:\n" +
@@ -42,7 +49,7 @@ const DEFAULT_SKILL_SYSTEM_INSTRUCTION = "" +
 	"This is very important:\n\n" +
 	"1. If a skill seems relevant to the current user query, you MUST use the `load_skill` tool with `name=\"<SKILL_NAME>\"` to read its full instructions before proceeding.\n" +
 	"2. Once you have read the instructions, follow them exactly as documented before replying to the user. For example, If the instruction lists multiple steps, please make sure you complete all of them in order.\n" +
-	"3. The `load_skill_resource` tool is for viewing files within a skill's directory (e.g., `references/*`, `assets/*`, `scripts/*`). Do NOT use other tools to access these files.\n" +
+	"3. The `load_skill_resource` tool is for viewing relative files within a skill's directory (e.g., `references/*`, `assets/*`, `scripts/*`, or files referenced beside SKILL.md). Do NOT use other tools to access these files.\n" +
 	"4. Use `run_skill_script` to run scripts from a skill's `scripts/` directory. Use `load_skill_resource` to view script content first if needed.\n"
 
 // SkillToolset A toolset for managing and interacting with agent skills.
@@ -55,6 +62,9 @@ type SkillToolset struct {
 func NewSkillToolset(skillList []*skills.Skill, codeExecutor code_executors.CodeExecutor) (*SkillToolset, error) {
 	m := make(map[string]*skills.Skill, len(skillList))
 	for _, s := range skillList {
+		if s == nil || s.Frontmatter == nil {
+			return nil, fmt.Errorf("skill and frontmatter are required")
+		}
 		if _, dup := m[s.Name()]; dup {
 			return nil, fmt.Errorf("duplicate skill name '%s'", s.Name())
 		}
@@ -192,44 +202,59 @@ func (s *SkillToolset) loadSkillResourceToolHandler(ctx tool.Context, args loadS
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("Skill '%s' not found.", args.SkillName), "error_code": "SKILL_NOT_FOUND"}, nil
 	}
-	var content string
-	var found bool
-	if strings.HasPrefix(args.Path, "references/") {
-		name := strings.TrimPrefix(args.Path, "references/")
-		content, found = sk.Resources.GetReference(name)
-	} else if strings.HasPrefix(args.Path, "assets/") {
-		name := strings.TrimPrefix(args.Path, "assets/")
-		content, found = sk.Resources.GetAsset(name)
-	} else if strings.HasPrefix(args.Path, "scripts/") {
-		name := strings.TrimPrefix(args.Path, "scripts/")
-		scr, ok2 := sk.Resources.GetScript(name)
-		if ok2 && scr != nil {
-			content, found = scr.Src, true
-		}
-	} else {
-		return map[string]any{
-			"error":      "Path must start with 'references/', 'assets/', or 'scripts/'.",
-			"error_code": "INVALID_RESOURCE_PATH",
-		}, nil
+	readContext := context.Background()
+	if ctx != nil {
+		readContext = ctx
 	}
-	if !found {
-		return map[string]any{
-			"error":      fmt.Sprintf("Resource '%s' not found in skill '%s'.", args.Path, args.SkillName),
-			"error_code": "RESOURCE_NOT_FOUND",
-		}, nil
+	data, err := sk.ReadResourceContext(readContext, args.Path, MAX_SKILL_PAYLOAD_BYTES)
+	if err != nil {
+		return resourceReadError(args, err), nil
 	}
-	return map[string]any{
+
+	mediaType := mime.TypeByExtension(filepath.Ext(args.Path))
+	if mediaType == "" {
+		mediaType = http.DetectContentType(data)
+	}
+	result := map[string]any{
 		"skill_name": sk.Name(),
 		"path":       args.Path,
-		"content":    content,
-	}, nil
+		"media_type": mediaType,
+	}
+	if utf8.Valid(data) && !bytes.ContainsRune(data, '\x00') {
+		result["content"] = string(data)
+		result["encoding"] = "utf-8"
+	} else {
+		result["content"] = base64.StdEncoding.EncodeToString(data)
+		result["encoding"] = "base64"
+	}
+	return result, nil
+}
+
+func resourceReadError(args loadSkillResourceArgs, err error) map[string]any {
+	code := "RESOURCE_READ_ERROR"
+	message := fmt.Sprintf("Resource '%s' in skill '%s' could not be read.", args.Path, args.SkillName)
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		code = "RESOURCE_READ_CANCELED"
+	case errors.Is(err, skills.ErrInvalidResourcePath):
+		code = "INVALID_RESOURCE_PATH"
+	case errors.Is(err, skills.ErrResourceNotFound):
+		code = "RESOURCE_NOT_FOUND"
+	case errors.Is(err, skills.ErrResourceTooLarge):
+		code = "RESOURCE_TOO_LARGE"
+	case errors.Is(err, skills.ErrResourceNotRegular):
+		code = "INVALID_RESOURCE_TYPE"
+	case errors.Is(err, skills.ErrResourceChanged):
+		code = "RESOURCE_CHANGED"
+	}
+	return map[string]any{"error": message, "error_code": code}
 }
 
 // loadSkillResourceTool Tool to load resources (references, assets, or scripts) from a skill."""
 func (s *SkillToolset) loadSkillResourceTool() tool.Tool {
 	t, _ := functiontool.New(functiontool.Config{
 		Name:        "load_skill_resource",
-		Description: "Loads a resource file (from references/, assets/, or scripts/) from within a skill.",
+		Description: "Loads a relative resource file from within a skill.",
 	}, s.loadSkillResourceToolHandler)
 	return t
 }
@@ -256,6 +281,9 @@ func (s *SkillToolset) runSkillScriptToolHandler(ctx tool.Context, args runSkill
 		name = strings.TrimPrefix(args.ScriptPath, "scripts/")
 	}
 
+	if sk.Resources == nil {
+		return map[string]any{"error": fmt.Sprintf("Script '%s' is not loaded for skill '%s'.", args.ScriptPath, args.SkillName), "error_code": "SCRIPT_NOT_LOADED"}, nil
+	}
 	if scr, ok := sk.Resources.GetScript(name); !ok || scr == nil {
 		return map[string]any{"error": fmt.Sprintf("Script '%s' not found in skill '%s'.", args.ScriptPath, args.SkillName), "error_code": "SCRIPT_NOT_FOUND"}, nil
 	}
