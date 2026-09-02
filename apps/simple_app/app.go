@@ -110,7 +110,7 @@ type Response struct {
 func (a *agentkitSimpleApp) newInvokeHandler() func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req Request
-		ctx := context.Background()
+		ctx := r.Context()
 
 		body, err := io.ReadAll(r.Body)
 		defer func() {
