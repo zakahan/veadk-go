@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"flag"
 
 	veagent "github.com/volcengine/veadk-go/agent/llmagent"
 	"github.com/volcengine/veadk-go/apps"
@@ -25,6 +26,14 @@ import (
 )
 
 func main() {
+	host := flag.String("host", "127.0.0.1", "HTTP listen host")
+	port := flag.Int("port", 8000, "HTTP listen port")
+	a2aPath := flag.String("a2a-path", "/", "internal A2A JSON-RPC route")
+	a2aPublicPath := flag.String("a2a-public-path", "", "A2A route advertised by Agent Cards (defaults to --a2a-path)")
+	publicURL := flag.String("public-url", "", "external base URL advertised by Agent Cards")
+	trustProxyHeaders := flag.Bool("trust-proxy-headers", false, "trust Forwarded and X-Forwarded-* headers from a reverse proxy")
+	flag.Parse()
+
 	ctx := context.Background()
 
 	a, err := veagent.New(&veagent.Config{})
@@ -33,7 +42,17 @@ func main() {
 		return
 	}
 
-	app := agentkit_server_app.NewAgentkitServerApp(apps.DefaultApiConfig())
+	apiConfig := apps.DefaultApiConfig().
+		SetHost(*host).
+		SetPort(*port).
+		SetA2APath(*a2aPath).
+		SetA2APublicPath(*a2aPublicPath).
+		SetPublicURL(*publicURL)
+	if *trustProxyHeaders {
+		apiConfig.SetAgentCardURLResolver(apps.ForwardedAgentCardURL)
+	}
+
+	app := agentkit_server_app.NewAgentkitServerApp(apiConfig)
 
 	err = app.Run(ctx, &apps.RunConfig{
 		AgentLoader: agent.NewSingleLoader(a),

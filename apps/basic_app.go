@@ -76,19 +76,28 @@ func (cfg *RunConfig) AppendObservability() {
 }
 
 type ApiConfig struct {
-	Host                string
-	Port                int
-	WriteTimeout        time.Duration
-	ReadTimeout         time.Duration
-	IdleTimeout         time.Duration
-	SEEWriteTimeout     time.Duration
-	ShutdownTimeout     time.Duration
-	ApiPathPrefix       string
-	DisableSimpleAPI    bool
-	DisableWebUI        bool
-	MaxRequestBodyBytes int64
-	DisableCORS         bool
-	CORS                CORSConfig
+	Host string
+	Port int
+	// PublicURL is the externally reachable base URL advertised in Agent Cards.
+	// It is never inferred from request headers unless AgentCardURLResolver is set.
+	PublicURL       string
+	WriteTimeout    time.Duration
+	ReadTimeout     time.Duration
+	IdleTimeout     time.Duration
+	SEEWriteTimeout time.Duration
+	ShutdownTimeout time.Duration
+	ApiPathPrefix   string
+	// A2APath is the route mounted on this HTTP server. A2APublicPath is the
+	// externally visible route advertised in Agent Cards and may differ when a
+	// reverse proxy rewrites paths.
+	A2APath              string
+	A2APublicPath        string
+	AgentCardURLResolver AgentCardURLResolver
+	DisableSimpleAPI     bool
+	DisableWebUI         bool
+	MaxRequestBodyBytes  int64
+	DisableCORS          bool
+	CORS                 CORSConfig
 }
 
 // CORSConfig controls cross-origin requests for every route served by an app.
@@ -274,6 +283,15 @@ func (a *ApiConfig) validate() error {
 	}
 	if a.MaxRequestBodyBytes < 0 {
 		return errors.New("request body limit must not be negative")
+	}
+	if a.PublicURL != "" && !validPublicURL(a.PublicURL) {
+		return errors.New("public URL must be an absolute HTTP or HTTPS URL without user info, query, or fragment")
+	}
+	if a.A2APath != "" && !strings.HasPrefix(a.A2APath, "/") {
+		return errors.New("A2A path must be absolute")
+	}
+	if a.A2APublicPath != "" && !strings.HasPrefix(a.A2APublicPath, "/") {
+		return errors.New("A2A public path must be absolute")
 	}
 	if !a.DisableCORS && a.CORS.AllowCredentials && slices.Contains(a.CORS.AllowedOrigins, "*") {
 		return errors.New("credentialed CORS cannot allow every origin")
