@@ -389,7 +389,7 @@ func TestLocalRuntimeScriptsTimeoutAndCancellation(t *testing.T) {
 	}
 	toolset, err := NewLocalSkillToolset(discovered, LocalRuntimeConfig{
 		WorkspaceRoot:  t.TempDir(),
-		CommandTimeout: 80 * time.Millisecond,
+		CommandTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -430,7 +430,15 @@ func TestLocalRuntimeScriptsTimeoutAndCancellation(t *testing.T) {
 			t.Fatalf("node script = %#v, %v", nodeResult, err)
 		}
 	}
-	timeoutResult, err := toolset.runSkillScriptToolHandler(ctx, runSkillScriptArgs{
+	timeoutToolset, err := NewLocalSkillToolset(discovered, LocalRuntimeConfig{
+		WorkspaceRoot:  t.TempDir(),
+		CommandTimeout: 80 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = timeoutToolset.Close() }()
+	timeoutResult, err := timeoutToolset.runSkillScriptToolHandler(ctx, runSkillScriptArgs{
 		SkillName: "script-tools", ScriptPath: "timeout.sh",
 	})
 	if err != nil || timeoutResult["status"] != "timeout" {
