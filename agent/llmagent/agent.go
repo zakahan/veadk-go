@@ -25,6 +25,7 @@ import (
 	"github.com/volcengine/veadk-go/knowledgebase"
 	"github.com/volcengine/veadk-go/model"
 	"github.com/volcengine/veadk-go/prompts"
+	"github.com/volcengine/veadk-go/skills"
 	"github.com/volcengine/veadk-go/tool/builtin_tools"
 	"github.com/volcengine/veadk-go/utils"
 	"google.golang.org/adk/agent"
@@ -46,9 +47,17 @@ type Config struct {
 	KnowledgeBase       *knowledgebase.KnowledgeBase
 	PromptManager       prompts.BasePromptManager
 	DisableThought      bool
+	// Skills contains local root directories whose immediate child directories
+	// are individual skills. Skills are discovered when the agent is created.
+	Skills                []string
+	SkillDiscoveryOptions skills.DiscoveryOptions
 }
 
 func New(cfg *Config) (agent.Agent, error) {
+	if err := configureLocalSkills(cfg); err != nil {
+		return nil, err
+	}
+
 	if cfg.Name == "" {
 		cfg.Name = common.DEFAULT_LLMAGENT_NAME
 	}

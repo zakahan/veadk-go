@@ -16,45 +16,26 @@ package main
 
 import (
 	"context"
-	"time"
+	"os"
 
 	veagent "github.com/volcengine/veadk-go/agent/llmagent"
 	"github.com/volcengine/veadk-go/apps"
 	"github.com/volcengine/veadk-go/apps/agentkit_server_app"
-	"github.com/volcengine/veadk-go/code_executors"
 	"github.com/volcengine/veadk-go/log"
-	"github.com/volcengine/veadk-go/skills"
-	"github.com/volcengine/veadk-go/tool/skilltool"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
-	adktool "google.golang.org/adk/tool"
 )
 
 func main() {
 	ctx := context.Background()
 
-	skillPathList := []string{
-		".adk/skills/multiplication-calculator",
-		".adk/skills/image-generate",
-		".adk/skills/video-generate",
-	}
-	var skillList []*skills.Skill
-	for _, path := range skillPathList {
-		skill, err := skills.LoadSkillFromDir(path)
-		if err != nil {
-			panic(err)
-		}
-		skillList = append(skillList, skill)
-	}
-
-	skillToolset, err := skilltool.NewSkillToolset(skillList, code_executors.NewUnsafeLocalCodeExecutor(300*time.Second))
-	if err != nil {
-		panic(err)
+	skillsRoot := os.Getenv("VEADK_SKILLS_DIR")
+	if skillsRoot == "" {
+		skillsRoot = ".adk/skills"
 	}
 	a, err := veagent.New(&veagent.Config{
-		Config: llmagent.Config{
-			Toolsets: []adktool.Toolset{skillToolset},
-		},
+		Config: llmagent.Config{},
+		Skills: []string{skillsRoot},
 	})
 	if err != nil {
 		log.Errorf("NewLLMAgent failed: %v", err)
