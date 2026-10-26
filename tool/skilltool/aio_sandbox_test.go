@@ -184,18 +184,22 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.listSkills(ctx, listSkillsArgs{}); err != nil {
+	tools, err := s.Tools(nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(tools) != 4 || tools[0].Name() != "bash" || tools[1].Name() != "read_file" || tools[2].Name() != "write_file" || tools[3].Name() != "edit_file" {
+		t.Fatalf("AIO tools = %v, want bash/read_file/write_file/edit_file", tools)
+	}
+	if !strings.Contains(s.Instruction(), "<path>/workspace/skills/demo</path>") || strings.Contains(s.Instruction(), "load_skill") {
+		t.Fatalf("AIO instruction does not describe direct Skill reads: %q", s.Instruction())
 	}
 	if catalogCalls != 0 {
 		t.Fatalf("sandbox catalog calls = %d, want 0", catalogCalls)
 	}
-	loaded, err := s.loadSkill(ctx, loadSkillArgs{Name: "demo"})
-	if err != nil || !strings.Contains(fmt.Sprint(loaded["instructions"]), "Base directory for this skill: /workspace/skills/demo") {
-		t.Fatalf("load_skill = %v, %v", loaded, err)
-	}
-	if _, err := s.loadResource(ctx, loadSkillResourceArgs{SkillName: "demo", Path: "../private"}); err == nil {
-		t.Fatal("resource traversal accepted")
+	loaded, err := s.readFile(ctx, readFileArgs{FilePath: "/workspace/skills/demo/SKILL.md", Offset: 1, Limit: 0})
+	if err != nil || !strings.Contains(loaded["content"].(string), "# Demo") {
+		t.Fatalf("read_file SKILL.md = %v, %v", loaded, err)
 	}
 	if _, err := s.writeFile(ctx, writeFileArgs{FilePath: "hello.txt", Content: "hello"}); err != nil {
 		t.Fatal(err)

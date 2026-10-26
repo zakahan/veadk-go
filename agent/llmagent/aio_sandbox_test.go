@@ -57,7 +57,7 @@ func TestAIOSkillsModeDiscoversAtConstruction(t *testing.T) {
 	if _, err := New(cfg); err != nil {
 		t.Fatalf("New() did not discover Skill Space: %v", err)
 	}
-	if calls.Load() != 1 || !strings.Contains(cfg.Instruction, "Demo Skill") || !strings.Contains(cfg.Instruction, "<name>demo</name>") {
+	if calls.Load() != 1 || !strings.Contains(cfg.Instruction, "Demo Skill") || !strings.Contains(cfg.Instruction, "<name>demo</name>") || !strings.Contains(cfg.Instruction, "<path>/workspace/skills/demo</path>") {
 		t.Fatalf("Agent prompt missing startup metadata: calls=%d instruction=%q", calls.Load(), cfg.Instruction)
 	}
 	if len(cfg.Toolsets) != 1 || len(cfg.BeforeAgentCallbacks) != 1 {

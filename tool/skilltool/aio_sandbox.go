@@ -36,7 +36,6 @@ const AIOSandboxSkillRoot = "/workspace/skills"
 // AIOSandboxToolset keeps immutable Agent-level Skill metadata and resolves
 // only the data-plane endpoint from the current ADK session.
 type AIOSandboxToolset struct {
-	catalog     map[string]aioSkill
 	instruction string
 	tools       []tool.Tool
 }
@@ -45,52 +44,43 @@ type AIOSandboxToolset struct {
 // Agent starts. The sandbox must materialize those Skills under
 // AIOSandboxSkillRoot/<name> from SKILL_SPACE_ID during CreateSession.
 func NewAIOSandboxToolset(metadata []skills.RemoteSkill) (*AIOSandboxToolset, error) {
-	s := &AIOSandboxToolset{catalog: make(map[string]aioSkill, len(metadata))}
+	s := &AIOSandboxToolset{}
+	catalog := make(map[string]aioSkill, len(metadata))
 	for _, item := range metadata {
 		front := &skills.Frontmatter{Name: item.Name, Description: item.Description}
 		if err := front.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid AIO Skill metadata: %w", err)
 		}
-		if _, exists := s.catalog[item.Name]; exists {
+		if _, exists := catalog[item.Name]; exists {
 			return nil, fmt.Errorf("duplicate AIO Skill name %q", item.Name)
 		}
-		s.catalog[item.Name] = aioSkill{Name: item.Name, Description: item.Description, Path: path.Join(AIOSandboxSkillRoot, item.Name, "SKILL.md")}
+		catalog[item.Name] = aioSkill{Name: item.Name, Description: item.Description, Path: path.Join(AIOSandboxSkillRoot, item.Name)}
 	}
 	var xml strings.Builder
 	xml.WriteString("<available_skills>\n")
-	names := make([]string, 0, len(s.catalog))
-	for name := range s.catalog {
+	names := make([]string, 0, len(catalog))
+	for name := range catalog {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		sk := s.catalog[name]
+		sk := catalog[name]
 		xml.WriteString("<skill><name>")
 		xml.WriteString(html.EscapeString(sk.Name))
 		xml.WriteString("</name><description>")
 		xml.WriteString(html.EscapeString(sk.Description))
-		xml.WriteString("</description></skill>\n")
+		xml.WriteString("</description><path>")
+		xml.WriteString(html.EscapeString(sk.Path))
+		xml.WriteString("</path></skill>\n")
 	}
 	xml.WriteString("</available_skills>")
-	s.instruction = DEFAULT_SKILL_SYSTEM_INSTRUCTION + "\nSkills are installed in " + AIOSandboxSkillRoot + " inside the current session sandbox. Use bash/read_file/write_file/edit_file there; they never access the Runtime host.\n" + xml.String()
+	s.instruction = "Skills are installed in the current session sandbox. Each path below is a Skill directory containing SKILL.md. When a Skill is relevant, use read_file on <path>/SKILL.md before following its instructions. Use read_file for other Skill files and bash to run scripts. The tools access the sandbox, not the Runtime host.\n\n" + xml.String()
 	add := func(t tool.Tool, err error) error {
 		if err != nil {
 			return err
 		}
 		s.tools = append(s.tools, t)
 		return nil
-	}
-	if err := add(functiontool.New(functiontool.Config{Name: "list_skills", Description: "Lists Skills in the current sandbox."}, s.listSkills)); err != nil {
-		return nil, err
-	}
-	if err := add(functiontool.New(functiontool.Config{Name: "load_skill", Description: "Loads SKILL.md instructions from the current sandbox."}, s.loadSkill)); err != nil {
-		return nil, err
-	}
-	if err := add(functiontool.New(functiontool.Config{Name: "load_skill_resource", Description: "Reads a relative resource inside a sandbox Skill directory."}, s.loadResource)); err != nil {
-		return nil, err
-	}
-	if err := add(functiontool.New(functiontool.Config{Name: "run_skill_script", Description: "Runs a script in a sandbox Skill's scripts directory."}, s.runScript)); err != nil {
-		return nil, err
 	}
 	if err := add(functiontool.New(functiontool.Config{Name: "bash", Description: "Runs a bash command in the current sandbox."}, s.bash)); err != nil {
 		return nil, err
@@ -117,124 +107,6 @@ func (s *AIOSandboxToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) {
 func (s *AIOSandboxToolset) Instruction() string { return s.instruction }
 
 type aioSkill struct{ Name, Description, Path string }
-
-func (s *AIOSandboxToolset) skill(ctx agent.Context, name string) (*aioClient, aioSkill, error) {
-	sk, ok := s.catalog[name]
-	if !ok {
-		return nil, aioSkill{}, fmt.Errorf("Skill %q not found", name)
-	}
-	client, err := aioClientFor(ctx)
-	if err != nil {
-		return nil, aioSkill{}, err
-	}
-	return client, sk, nil
-}
-
-func (s *AIOSandboxToolset) listSkills(ctx agent.Context, _ listSkillsArgs) (map[string]any, error) {
-	out := make([]map[string]string, 0, len(s.catalog))
-	names := make([]string, 0, len(s.catalog))
-	for name := range s.catalog {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		sk := s.catalog[name]
-		out = append(out, map[string]string{"name": sk.Name, "description": sk.Description, "path": sk.Path})
-	}
-	return map[string]any{"skills": out}, nil
-}
-
-func (s *AIOSandboxToolset) loadSkill(ctx agent.Context, args loadSkillArgs) (map[string]any, error) {
-	client, sk, err := s.skill(ctx, args.Name)
-	if err != nil {
-		return nil, err
-	}
-	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": sk.Path})
-	if err != nil {
-		return nil, fmt.Errorf("Skill %q is unavailable at %s in the bound sandbox: %w", sk.Name, sk.Path, err)
-	}
-	content, ok := data["content"].(string)
-	if !ok {
-		return nil, errors.New("invalid AIO Skill content")
-	}
-	return map[string]any{"skill_name": sk.Name, "instructions": "Base directory for this skill: " + path.Dir(sk.Path) + "\n\n" + content, "frontmatter": map[string]string{"name": sk.Name, "description": sk.Description}}, nil
-}
-
-func aioRelative(base, relative string) (string, error) {
-	if relative == "" || strings.ContainsAny(relative, "\x00\\") || path.IsAbs(relative) {
-		return "", errors.New("resource path must be relative to the Skill")
-	}
-	clean := path.Clean(relative)
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
-		return "", errors.New("resource path escapes the Skill")
-	}
-	return path.Join(base, clean), nil
-}
-
-func (s *AIOSandboxToolset) loadResource(ctx agent.Context, args loadSkillResourceArgs) (map[string]any, error) {
-	client, sk, err := s.skill(ctx, args.SkillName)
-	if err != nil {
-		return nil, err
-	}
-	file, err := aioRelative(path.Dir(sk.Path), args.Path)
-	if err != nil {
-		return nil, err
-	}
-	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": file})
-	if err != nil {
-		return nil, err
-	}
-	content, ok := data["content"].(string)
-	if !ok {
-		return nil, errors.New("invalid AIO resource content")
-	}
-	return map[string]any{"skill_name": sk.Name, "path": args.Path, "content": content, "encoding": "utf-8"}, nil
-}
-
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
-
-func (s *AIOSandboxToolset) runScript(ctx agent.Context, args runSkillScriptArgs) (map[string]any, error) {
-	client, sk, err := s.skill(ctx, args.SkillName)
-	if err != nil {
-		return nil, err
-	}
-	requested := strings.TrimPrefix(args.ScriptPath, "scripts/")
-	file, err := aioRelative(path.Join(path.Dir(sk.Path), "scripts"), requested)
-	if err != nil {
-		return nil, err
-	}
-	if !strings.HasPrefix(file, path.Join(path.Dir(sk.Path), "scripts")+"/") {
-		return nil, errors.New("invalid Skill script path")
-	}
-	var program string
-	switch path.Ext(file) {
-	case ".py":
-		program = "python3"
-	case ".js", ".mjs", ".cjs":
-		program = "node"
-	case ".sh", ".bash":
-		program = "bash"
-	default:
-		return nil, errors.New("unsupported Skill script type")
-	}
-	if len(args.Args) > maxScriptArguments {
-		return nil, errors.New("too many Skill script arguments")
-	}
-	command := program + " " + shellQuote(file)
-	for _, arg := range args.Args {
-		if len(arg) > maxScriptArgumentBytes || strings.IndexByte(arg, 0) >= 0 {
-			return nil, errors.New("invalid Skill script argument")
-		}
-		command += " " + shellQuote(arg)
-	}
-	result, err := client.bash(ctx, command, 600*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	result["skill_name"] = sk.Name
-	result["script_path"] = args.ScriptPath
-	return result, nil
-}
 
 func (s *AIOSandboxToolset) bash(ctx agent.Context, args bashArgs) (map[string]any, error) {
 	client, err := aioClientFor(ctx)
