@@ -23,11 +23,13 @@ import (
 	"github.com/volcengine/veadk-go/v2/auth/veauth"
 	"github.com/volcengine/veadk-go/v2/common"
 	"github.com/volcengine/veadk-go/v2/configs"
+	agentkit "github.com/volcengine/veadk-go/v2/integrations/agentkit"
 	"github.com/volcengine/veadk-go/v2/knowledgebase"
 	"github.com/volcengine/veadk-go/v2/model"
 	"github.com/volcengine/veadk-go/v2/prompts"
 	"github.com/volcengine/veadk-go/v2/skills"
 	"github.com/volcengine/veadk-go/v2/tool/builtin_tools"
+	"github.com/volcengine/veadk-go/v2/tool/skilltool"
 	"github.com/volcengine/veadk-go/v2/utils"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
@@ -35,6 +37,7 @@ import (
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/loadmemorytool"
+	"google.golang.org/genai"
 )
 
 var longTermMemoryByAgent sync.Map
@@ -55,15 +58,39 @@ type Config struct {
 	LongTermMemory memory.Service
 	PromptManager  prompts.BasePromptManager
 	DisableThought bool
-	// Skills contains local root directories whose immediate child directories
-	// are individual skills. Skills are discovered when the agent is created.
+	// Skills contains local root directories by default. In aio_sandbox mode,
+	// these are absolute directories inside the session sandbox; an empty list
+	// uses the sandbox's default Skill catalog.
 	Skills                []string
 	SkillDiscoveryOptions skills.DiscoveryOptions
+	// SkillsMode selects local (the default) or session-bound aio_sandbox Skills.
+	SkillsMode string
 }
 
 func New(cfg *Config) (agent.Agent, error) {
-	if err := configureLocalSkills(cfg); err != nil {
-		return nil, err
+	if cfg == nil {
+		return nil, fmt.Errorf("llmagent config is required")
+	}
+	switch cfg.SkillsMode {
+	case "", "local":
+		if err := configureLocalSkills(cfg); err != nil {
+			return nil, err
+		}
+	case "aio_sandbox":
+		toolset, err := skilltool.NewAIOSandboxToolset(cfg.Skills)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Toolsets = append(cfg.Toolsets, toolset)
+		cfg.BeforeAgentCallbacks = append([]agent.BeforeAgentCallback{func(ctx agent.Context) (*genai.Content, error) {
+			_, err := agentkit.EnsureAIOSandbox(ctx)
+			if err != nil {
+				ctx.EndInvocation()
+			}
+			return nil, err
+		}}, cfg.BeforeAgentCallbacks...)
+	default:
+		return nil, fmt.Errorf("unsupported SkillsMode %q", cfg.SkillsMode)
 	}
 
 	if cfg.Name == "" {

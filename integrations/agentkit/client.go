@@ -15,11 +15,13 @@
 package agentkit
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/volcengine/veadk-go/v2/auth/veauth"
 	"github.com/volcengine/veadk-go/v2/common"
@@ -88,6 +90,34 @@ func (c *Client) Do(action string, body map[string]any) (map[string]any, error) 
 	var response map[string]any
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return nil, fmt.Errorf("AgentKit %s unmarshal response %s failed: %w", action, raw, err)
+	}
+	return response, nil
+}
+
+// DoContext sends a signed control-plane request that observes cancellation.
+func (c *Client) DoContext(ctx context.Context, action string, body map[string]any) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
+	raw, err := (ve_sign.VeRequest{
+		AK: c.AK, SK: c.SK, Method: http.MethodPost, Scheme: c.Scheme,
+		Host: c.Host, Path: "/", Service: c.Service, Region: c.Region,
+		Action: action, Version: APIVersion, Header: c.Header, Body: body,
+	}).DoRequestWithContext(requestCtx, &http.Client{
+		Timeout:       35 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	})
+	if err != nil {
+		return nil, fmt.Errorf("AgentKit %s request failed: %w", action, err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("AgentKit %s returned invalid JSON: %w", action, err)
+	}
+	if metadata, ok := response["ResponseMetadata"].(map[string]any); ok && metadata["Error"] != nil {
+		return nil, fmt.Errorf("AgentKit %s rejected the request", action)
 	}
 	return response, nil
 }
