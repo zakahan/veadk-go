@@ -18,7 +18,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sync"
+	"time"
 
 	"github.com/volcengine/veadk-go/v2/auth/veauth"
 	"github.com/volcengine/veadk-go/v2/common"
@@ -41,6 +43,7 @@ import (
 )
 
 var longTermMemoryByAgent sync.Map
+var aioSkillSpaceID = regexp.MustCompile(`^ss-[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 type Config struct {
 	llmagent.Config
@@ -59,31 +62,39 @@ type Config struct {
 	PromptManager  prompts.BasePromptManager
 	DisableThought bool
 	// Skills contains local root directories by default. In aio_sandbox mode,
-	// these are absolute directories inside the session sandbox; an empty list
-	// uses the sandbox's default Skill catalog.
+	// it contains Skill Space IDs discovered when the Agent is constructed.
 	Skills                []string
 	SkillDiscoveryOptions skills.DiscoveryOptions
 	// SkillsMode selects local (the default) or session-bound aio_sandbox Skills.
 	SkillsMode string
+	// SkillSpaceSourceConfig optionally overrides the Skill service endpoint,
+	// region or credentials. SpaceID is taken from each entry in Skills.
+	SkillSpaceSourceConfig skills.RemoteSourceConfig
 }
 
 func New(cfg *Config) (agent.Agent, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("llmagent config is required")
 	}
+	var aioInstruction string
 	switch cfg.SkillsMode {
 	case "", "local":
 		if err := configureLocalSkills(cfg); err != nil {
 			return nil, err
 		}
 	case "aio_sandbox":
-		toolset, err := skilltool.NewAIOSandboxToolset(cfg.Skills)
+		metadata, ids, err := discoverAIOSkills(cfg)
 		if err != nil {
 			return nil, err
 		}
+		toolset, err := skilltool.NewAIOSandboxToolset(metadata)
+		if err != nil {
+			return nil, err
+		}
+		aioInstruction = toolset.Instruction()
 		cfg.Toolsets = append(cfg.Toolsets, toolset)
 		cfg.BeforeAgentCallbacks = append([]agent.BeforeAgentCallback{func(ctx agent.Context) (*genai.Content, error) {
-			_, err := agentkit.EnsureAIOSandbox(ctx)
+			_, err := agentkit.EnsureAIOSandboxWithSkills(ctx, ids)
 			if err != nil {
 				ctx.EndInvocation()
 			}
@@ -103,6 +114,9 @@ func New(cfg *Config) (agent.Agent, error) {
 		} else {
 			cfg.Instruction = prompts.DEFAULT_INSTRUCTION
 		}
+	}
+	if aioInstruction != "" {
+		cfg.Instruction += "\n\n" + aioInstruction
 	}
 
 	if cfg.Description == "" {
@@ -191,6 +205,49 @@ func New(cfg *Config) (agent.Agent, error) {
 		longTermMemoryByAgent.Store(a, cfg.LongTermMemory)
 	}
 	return a, nil
+}
+
+func discoverAIOSkills(cfg *Config) ([]skills.RemoteSkill, []string, error) {
+	ids := append([]string(nil), cfg.Skills...)
+	metadata := make([]skills.RemoteSkill, 0)
+	seenIDs := map[string]bool{}
+	seenNames := map[string]bool{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, id := range ids {
+		if !aioSkillSpaceID.MatchString(id) || seenIDs[id] {
+			return nil, nil, fmt.Errorf("aio_sandbox Skills must contain unique AgentKit Skill Space IDs; invalid value %q", id)
+		}
+		seenIDs[id] = true
+		options := cfg.SkillSpaceSourceConfig
+		options.SpaceID = id
+		service, region, host, scheme := agentkit.EndpointConfig()
+		if options.Endpoint == "" {
+			options.Endpoint = scheme + "://" + host
+		}
+		if options.Region == "" {
+			options.Region = region
+		}
+		if options.Service == "" {
+			options.Service = service
+		}
+		source, err := skills.NewRemoteSource(options)
+		if err != nil {
+			return nil, nil, fmt.Errorf("configure Skill Space %q: %w", id, err)
+		}
+		found, err := source.Discover(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("discover Skill Space %q: %w", id, err)
+		}
+		for _, sk := range found {
+			if seenNames[sk.Name] {
+				return nil, nil, fmt.Errorf("duplicate Skill name %q across Skill Spaces", sk.Name)
+			}
+			seenNames[sk.Name] = true
+			metadata = append(metadata, sk)
+		}
+	}
+	return metadata, ids, nil
 }
 
 func LongTermMemoryFor(a agent.Agent) (memory.Service, bool) {

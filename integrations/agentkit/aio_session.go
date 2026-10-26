@@ -26,9 +26,10 @@ const aioSessionTTL = 1800
 // AIOBinding contains only references; endpoints and credentials are resolved
 // afresh from the control plane for each invocation.
 type AIOBinding struct {
-	ToolID    string `json:"tool_id"`
-	SessionID string `json:"session_id"`
-	Identity  string `json:"identity"`
+	ToolID        string `json:"tool_id"`
+	SessionID     string `json:"session_id"`
+	Identity      string `json:"identity"`
+	SkillSpaceIDs string `json:"skill_space_ids,omitempty"`
 }
 
 type aioSession struct {
@@ -41,6 +42,15 @@ func aioIdentity(appName, userID, sessionID string) string {
 	data, _ := json.Marshal([]string{appName, userID, sessionID})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func aioPhysicalPrefix(identity, skillSpaceIDs string) string {
+	prefix := "veadk-aio-" + identity
+	if skillSpaceIDs != "" {
+		sum := sha256.Sum256([]byte(skillSpaceIDs))
+		prefix += "_s_" + hex.EncodeToString(sum[:6])
+	}
+	return prefix
 }
 
 func bindingFromState(state session.ReadonlyState) (*AIOBinding, error) {
@@ -67,6 +77,12 @@ func aioToolID() string { return strings.TrimSpace(os.Getenv("AGENTKIT_TOOL_ID")
 // EnsureAIOSandbox binds an ADK session before any model or tool execution.
 // Concurrent binding attempts for the same session are serialized locally.
 func EnsureAIOSandbox(ctx agent.Context) (*AIOBinding, error) {
+	return EnsureAIOSandboxWithSkills(ctx, nil)
+}
+
+// EnsureAIOSandboxWithSkills passes the Agent's pinned Skill Space selection
+// to a newly created sandbox and rejects reuse with a different selection.
+func EnsureAIOSandboxWithSkills(ctx agent.Context, skillSpaceIDs []string) (*AIOBinding, error) {
 	if ctx == nil {
 		return nil, errors.New("AIO sandbox requires app, user and session identity")
 	}
@@ -77,12 +93,17 @@ func EnsureAIOSandbox(ctx agent.Context) (*AIOBinding, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve AgentKit client: %w", err)
 	}
-	return EnsureAIOBinding(ctx, client, ctx.State(), ctx.AppName(), ctx.UserID(), ctx.SessionID())
+	return EnsureAIOBindingWithSkills(ctx, client, ctx.State(), ctx.AppName(), ctx.UserID(), ctx.SessionID(), skillSpaceIDs)
 }
 
 // EnsureAIOBinding is shared by Runner callbacks and session-creation handlers.
 // The caller owns persisting state in its configured ADK SessionService.
 func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, appName, userID, sessionID string) (*AIOBinding, error) {
+	return EnsureAIOBindingWithSkills(ctx, client, state, appName, userID, sessionID, nil)
+}
+
+// EnsureAIOBindingWithSkills is also available to session-creation handlers.
+func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state session.State, appName, userID, sessionID string, skillSpaceIDs []string) (*AIOBinding, error) {
 	if ctx == nil || client == nil || state == nil || appName == "" || userID == "" || sessionID == "" {
 		return nil, errors.New("AIO sandbox requires client, state, app, user and session identity")
 	}
@@ -91,6 +112,7 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 		return nil, errors.New("AGENTKIT_TOOL_ID is required for aio_sandbox")
 	}
 	identity := aioIdentity(appName, userID, sessionID)
+	skillSpaceValue := strings.Join(skillSpaceIDs, ",")
 	sum := sha256.Sum256([]byte(toolID + "\x00" + identity))
 	lock := &aioSessionLocks[int(sum[0])%len(aioSessionLocks)]
 	lock.Lock()
@@ -98,7 +120,7 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 	if existing, err := bindingFromState(state); err != nil {
 		return nil, err
 	} else if existing != nil {
-		if existing.Identity != identity || existing.ToolID != toolID {
+		if existing.Identity != identity || existing.ToolID != toolID || existing.SkillSpaceIDs != skillSpaceValue {
 			return nil, errors.New("AIO sandbox binding does not match this session")
 		}
 		if _, err := readyAIOSession(ctx, client, *existing); err != nil {
@@ -106,7 +128,7 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 		}
 		return existing, nil
 	}
-	userSessionID := "veadk-aio-" + identity
+	userSessionID := aioPhysicalPrefix(identity, skillSpaceValue)
 	candidates, err := listAIOSessions(ctx, client, toolID, userSessionID)
 	if err != nil {
 		return nil, err
@@ -139,9 +161,11 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 			hash := sha256.Sum256(data)
 			physicalID += "_r_" + hex.EncodeToString(hash[:6])
 		}
-		created, createErr := client.DoContext(ctx, "CreateSession", map[string]any{
-			"ToolId": toolID, "UserSessionId": physicalID, "Ttl": aioSessionTTL,
-		})
+		body := map[string]any{"ToolId": toolID, "UserSessionId": physicalID, "Ttl": aioSessionTTL}
+		if skillSpaceValue != "" {
+			body["Envs"] = []map[string]string{{"Key": "SKILL_SPACE_ID", "Value": skillSpaceValue}}
+		}
+		created, createErr := client.DoContext(ctx, "CreateSession", body)
 		if createErr == nil {
 			value := parseAIOSession(created)
 			chosen = &value
@@ -166,12 +190,12 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 	if chosen.ID == "" {
 		return nil, errors.New("AgentKit session response has no SessionId")
 	}
-	binding := &AIOBinding{ToolID: toolID, SessionID: chosen.ID, Identity: identity}
+	binding := &AIOBinding{ToolID: toolID, SessionID: chosen.ID, Identity: identity, SkillSpaceIDs: skillSpaceValue}
 	if _, err := readyAIOSession(ctx, client, *binding); err != nil {
 		return nil, err
 	}
 	if err := state.Set(AIOSandboxStateKey, map[string]string{
-		"tool_id": toolID, "session_id": chosen.ID, "identity": identity,
+		"tool_id": toolID, "session_id": chosen.ID, "identity": identity, "skill_space_ids": skillSpaceValue,
 	}); err != nil {
 		return nil, fmt.Errorf("persist AIO sandbox binding: %w", err)
 	}
@@ -230,7 +254,7 @@ func readyAIOSession(ctx context.Context, client *Client, binding AIOBinding) (*
 		if info.ID != "" && info.ID != binding.SessionID {
 			return nil, errors.New("AgentKit returned another sandbox session")
 		}
-		expectedUserSessionID := "veadk-aio-" + binding.Identity
+		expectedUserSessionID := aioPhysicalPrefix(binding.Identity, binding.SkillSpaceIDs)
 		if info.UserID != expectedUserSessionID && !strings.HasPrefix(info.UserID, expectedUserSessionID+"_r_") {
 			return nil, errors.New("bound AIO sandbox belongs to another ADK session")
 		}

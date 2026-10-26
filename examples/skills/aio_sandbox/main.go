@@ -15,15 +15,15 @@ import (
 )
 
 func main() {
-	paths := flag.String("skills", "", "comma-separated absolute Skill directories inside the sandbox; empty uses the default catalog")
+	spaces := flag.String("skills", "", "comma-separated AgentKit Skill Space IDs, such as ss-xxx")
 	prompt := flag.String("prompt", "Use bash to print the current working directory.", "user request")
 	sessionID := flag.String("session", "aio-example", "ADK session ID")
 	flag.Parse()
-	var roots []string
-	if *paths != "" {
-		roots = strings.Split(*paths, ",")
+	var ids []string
+	if *spaces != "" {
+		ids = strings.Split(*spaces, ",")
 	}
-	a, err := veagent.New(&veagent.Config{SkillsMode: "aio_sandbox", Skills: roots})
+	a, err := veagent.New(&veagent.Config{SkillsMode: "aio_sandbox", Skills: ids})
 	if err != nil {
 		fail(err)
 	}

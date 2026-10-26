@@ -23,32 +23,56 @@ import (
 
 	"github.com/google/uuid"
 	agentkit "github.com/volcengine/veadk-go/v2/integrations/agentkit"
+	"github.com/volcengine/veadk-go/v2/skills"
 	"google.golang.org/adk/v2/agent"
-	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
-	"google.golang.org/genai"
 )
 
 const aioMaxResponse = 4 << 20
 const aioMaxOutput = 50_000
+const AIOSandboxSkillRoot = "/workspace/skills"
 
-// AIOSandboxToolset resolves all paths and the endpoint from the current ADK
-// session. It never keeps a session's catalog or endpoint on the shared toolset.
+// AIOSandboxToolset keeps immutable Agent-level Skill metadata and resolves
+// only the data-plane endpoint from the current ADK session.
 type AIOSandboxToolset struct {
-	paths []string
-	tools []tool.Tool
+	catalog     map[string]aioSkill
+	instruction string
+	tools       []tool.Tool
 }
 
-func NewAIOSandboxToolset(paths []string) (*AIOSandboxToolset, error) {
-	cleaned := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if !path.IsAbs(p) || strings.ContainsAny(p, "\x00\\") {
-			return nil, fmt.Errorf("AIO Skill path %q must be an absolute sandbox path", p)
+// NewAIOSandboxToolset accepts a metadata snapshot discovered before the
+// Agent starts. The sandbox must materialize those Skills under
+// AIOSandboxSkillRoot/<name> from SKILL_SPACE_ID during CreateSession.
+func NewAIOSandboxToolset(metadata []skills.RemoteSkill) (*AIOSandboxToolset, error) {
+	s := &AIOSandboxToolset{catalog: make(map[string]aioSkill, len(metadata))}
+	for _, item := range metadata {
+		front := &skills.Frontmatter{Name: item.Name, Description: item.Description}
+		if err := front.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid AIO Skill metadata: %w", err)
 		}
-		cleaned = append(cleaned, path.Clean(p))
+		if _, exists := s.catalog[item.Name]; exists {
+			return nil, fmt.Errorf("duplicate AIO Skill name %q", item.Name)
+		}
+		s.catalog[item.Name] = aioSkill{Name: item.Name, Description: item.Description, Path: path.Join(AIOSandboxSkillRoot, item.Name, "SKILL.md")}
 	}
-	s := &AIOSandboxToolset{paths: cleaned}
+	var xml strings.Builder
+	xml.WriteString("<available_skills>\n")
+	names := make([]string, 0, len(s.catalog))
+	for name := range s.catalog {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sk := s.catalog[name]
+		xml.WriteString("<skill><name>")
+		xml.WriteString(html.EscapeString(sk.Name))
+		xml.WriteString("</name><description>")
+		xml.WriteString(html.EscapeString(sk.Description))
+		xml.WriteString("</description></skill>\n")
+	}
+	xml.WriteString("</available_skills>")
+	s.instruction = DEFAULT_SKILL_SYSTEM_INSTRUCTION + "\nSkills are installed in " + AIOSandboxSkillRoot + " inside the current session sandbox. Use bash/read_file/write_file/edit_file there; they never access the Runtime host.\n" + xml.String()
 	add := func(t tool.Tool, err error) error {
 		if err != nil {
 			return err
@@ -88,101 +112,33 @@ func (s *AIOSandboxToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) {
 	return append([]tool.Tool(nil), s.tools...), nil
 }
 
-func (s *AIOSandboxToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
-	client, err := aioClientFor(ctx)
-	if err != nil {
-		return err
-	}
-	catalog, err := s.catalog(ctx, client)
-	if err != nil {
-		return err
-	}
-	var xml strings.Builder
-	xml.WriteString("<available_skills>\n")
-	names := make([]string, 0, len(catalog))
-	for name := range catalog {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		sk := catalog[name]
-		xml.WriteString("<skill><name>")
-		xml.WriteString(html.EscapeString(sk.Name))
-		xml.WriteString("</name><description>")
-		xml.WriteString(html.EscapeString(sk.Description))
-		xml.WriteString("</description></skill>\n")
-	}
-	xml.WriteString("</available_skills>")
-	instruction := DEFAULT_SKILL_SYSTEM_INSTRUCTION + "\nSandbox Skill paths are inside the current session sandbox. Use bash/read_file/write_file/edit_file there; never assume they access the Runtime host.\n" + xml.String()
-	if req.Config.SystemInstruction == nil {
-		req.Config.SystemInstruction = &genai.Content{Role: "user"}
-	}
-	req.Config.SystemInstruction.Parts = append(req.Config.SystemInstruction.Parts, &genai.Part{Text: instruction})
-	return nil
-}
+// Instruction is complete at Agent construction and never depends on a
+// session-bound sandbox or a per-invocation catalog request.
+func (s *AIOSandboxToolset) Instruction() string { return s.instruction }
 
 type aioSkill struct{ Name, Description, Path string }
 
-func (s *AIOSandboxToolset) catalog(ctx context.Context, client *aioClient) (map[string]aioSkill, error) {
-	data, err := client.call(ctx, "GET", "/v1/skills", nil, s.paths)
-	if err != nil {
-		return nil, err
-	}
-	items, ok := data["skills"].([]any)
-	if !ok {
-		return nil, errors.New("invalid AIO Skill catalog")
-	}
-	result := make(map[string]aioSkill, len(items))
-	for _, raw := range items {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			return nil, errors.New("invalid AIO Skill metadata")
-		}
-		sk := aioSkill{Name: aioString(item, "name"), Description: aioString(item, "description"), Path: aioString(item, "path")}
-		if sk.Name == "" || sk.Description == "" || !path.IsAbs(sk.Path) || strings.ContainsAny(sk.Path, "\x00\\") || path.Clean(sk.Path) != sk.Path {
-			return nil, errors.New("invalid AIO Skill metadata")
-		}
-		if _, exists := result[sk.Name]; exists {
-			return nil, errors.New("duplicate AIO Skill name")
-		}
-		result[sk.Name] = sk
-	}
-	return result, nil
-}
-
 func (s *AIOSandboxToolset) skill(ctx agent.Context, name string) (*aioClient, aioSkill, error) {
+	sk, ok := s.catalog[name]
+	if !ok {
+		return nil, aioSkill{}, fmt.Errorf("Skill %q not found", name)
+	}
 	client, err := aioClientFor(ctx)
 	if err != nil {
 		return nil, aioSkill{}, err
-	}
-	catalog, err := s.catalog(ctx, client)
-	if err != nil {
-		return nil, aioSkill{}, err
-	}
-	sk, ok := catalog[name]
-	if !ok {
-		return nil, aioSkill{}, fmt.Errorf("Skill %q not found", name)
 	}
 	return client, sk, nil
 }
 
 func (s *AIOSandboxToolset) listSkills(ctx agent.Context, _ listSkillsArgs) (map[string]any, error) {
-	client, err := aioClientFor(ctx)
-	if err != nil {
-		return nil, err
-	}
-	catalog, err := s.catalog(ctx, client)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]map[string]string, 0, len(catalog))
-	names := make([]string, 0, len(catalog))
-	for name := range catalog {
+	out := make([]map[string]string, 0, len(s.catalog))
+	names := make([]string, 0, len(s.catalog))
+	for name := range s.catalog {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		sk := catalog[name]
+		sk := s.catalog[name]
 		out = append(out, map[string]string{"name": sk.Name, "description": sk.Description, "path": sk.Path})
 	}
 	return map[string]any{"skills": out}, nil
@@ -193,9 +149,9 @@ func (s *AIOSandboxToolset) loadSkill(ctx agent.Context, args loadSkillArgs) (ma
 	if err != nil {
 		return nil, err
 	}
-	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": sk.Path}, nil)
+	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": sk.Path})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Skill %q is unavailable at %s in the bound sandbox: %w", sk.Name, sk.Path, err)
 	}
 	content, ok := data["content"].(string)
 	if !ok {
@@ -224,7 +180,7 @@ func (s *AIOSandboxToolset) loadResource(ctx agent.Context, args loadSkillResour
 	if err != nil {
 		return nil, err
 	}
-	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": file}, nil)
+	data, err := client.call(ctx, "POST", "/v1/file/read", map[string]any{"file": file})
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +278,7 @@ func (s *AIOSandboxToolset) readFile(ctx agent.Context, args readFileArgs) (map[
 	if args.Limit > 0 {
 		body["end_line"] = start + min(args.Limit, maxReadLines)
 	}
-	data, err := client.call(ctx, "POST", "/v1/file/read", body, nil)
+	data, err := client.call(ctx, "POST", "/v1/file/read", body)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +312,7 @@ func (s *AIOSandboxToolset) writeFile(ctx agent.Context, args writeFileArgs) (ma
 	if err != nil {
 		return nil, err
 	}
-	_, err = client.call(ctx, "POST", "/v1/file/write", map[string]any{"file": file, "content": args.Content}, nil)
+	_, err = client.call(ctx, "POST", "/v1/file/write", map[string]any{"file": file, "content": args.Content})
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +335,7 @@ func (s *AIOSandboxToolset) editFile(ctx agent.Context, args editFileArgs) (map[
 	if args.ReplaceAll {
 		body["replace_mode"] = "ALL"
 	}
-	data, err := client.call(ctx, "POST", "/v1/file/str_replace_editor", body, nil)
+	data, err := client.call(ctx, "POST", "/v1/file/str_replace_editor", body)
 	if err != nil {
 		return nil, err
 	}
@@ -414,13 +370,10 @@ func aioClientFor(ctx agent.Context) (*aioClient, error) {
 	return &aioClient{base: u, client: aioHTTPClient, headers: headers}, nil
 }
 
-func (c *aioClient) call(ctx context.Context, method, endpoint string, body any, paths []string) (map[string]any, error) {
+func (c *aioClient) call(ctx context.Context, method, endpoint string, body any) (map[string]any, error) {
 	u := *c.base
 	u.Path = strings.TrimRight(u.Path, "/") + endpoint
 	query := u.Query()
-	for _, p := range paths {
-		query.Add("path", p)
-	}
 	u.RawQuery = query.Encode()
 	var payload io.Reader
 	if body != nil {
@@ -494,20 +447,20 @@ func (c *aioClient) bash(ctx context.Context, command string, timeout time.Durat
 		cleanupCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
 		defer done()
 		if !terminal {
-			if _, cleanupErr := c.call(cleanupCtx, "POST", "/v1/bash/kill", map[string]any{"session_id": shellID, "signal": "SIGKILL"}, nil); cleanupErr != nil && err == nil {
+			if _, cleanupErr := c.call(cleanupCtx, "POST", "/v1/bash/kill", map[string]any{"session_id": shellID, "signal": "SIGKILL"}); cleanupErr != nil && err == nil {
 				err = fmt.Errorf("AIO bash cleanup state unknown: %w", cleanupErr)
 			}
 		}
-		if _, cleanupErr := c.call(cleanupCtx, "POST", "/v1/bash/sessions/"+shellID+"/close", map[string]any{}, nil); cleanupErr != nil && err == nil {
+		if _, cleanupErr := c.call(cleanupCtx, "POST", "/v1/bash/sessions/"+shellID+"/close", map[string]any{}); cleanupErr != nil && err == nil {
 			err = fmt.Errorf("AIO bash cleanup state unknown: %w", cleanupErr)
 		}
 	}()
 	created = true // creation may have succeeded even if its response is lost
-	_, err = c.call(commandCtx, "POST", "/v1/bash/sessions/create", map[string]any{"session_id": shellID, "exec_dir": "/workspace"}, nil)
+	_, err = c.call(commandCtx, "POST", "/v1/bash/sessions/create", map[string]any{"session_id": shellID, "exec_dir": "/workspace"})
 	if err != nil {
 		return nil, err
 	}
-	info, err := c.call(commandCtx, "POST", "/v1/bash/exec", map[string]any{"session_id": shellID, "command": command, "async_mode": true, "hard_timeout": timeout.Seconds(), "max_output_length": aioMaxOutput}, nil)
+	info, err := c.call(commandCtx, "POST", "/v1/bash/exec", map[string]any{"session_id": shellID, "command": command, "async_mode": true, "hard_timeout": timeout.Seconds(), "max_output_length": aioMaxOutput})
 	if err != nil {
 		return nil, err
 	}
@@ -537,7 +490,7 @@ func (c *aioClient) bash(ctx context.Context, command string, timeout time.Durat
 		if commandID == "" {
 			return nil, errors.New("invalid AIO bash command response")
 		}
-		data, pollErr := c.call(commandCtx, "POST", "/v1/bash/output", map[string]any{"session_id": shellID, "command_id": commandID, "offset": info["offset"], "stderr_offset": info["stderr_offset"], "wait": true, "wait_timeout": 1}, nil)
+		data, pollErr := c.call(commandCtx, "POST", "/v1/bash/output", map[string]any{"session_id": shellID, "command_id": commandID, "offset": info["offset"], "stderr_offset": info["stderr_offset"], "wait": true, "wait_timeout": 1})
 		if pollErr != nil {
 			return nil, pollErr
 		}

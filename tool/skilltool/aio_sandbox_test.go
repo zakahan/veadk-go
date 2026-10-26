@@ -17,6 +17,7 @@ import (
 	"time"
 
 	agentkit "github.com/volcengine/veadk-go/v2/integrations/agentkit"
+	"github.com/volcengine/veadk-go/v2/skills"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/session"
 )
@@ -61,7 +62,8 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 	var mu sync.Mutex
 	var creates, closes int
 	var physicalID string
-	var catalogPaths []string
+	var createdSkillSpace string
+	var catalogCalls int
 	var writes []map[string]any
 	var edits []map[string]any
 	var endpoint string
@@ -80,6 +82,11 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 				mu.Lock()
 				creates++
 				physicalID, _ = request["UserSessionId"].(string)
+				if envs, ok := request["Envs"].([]any); ok && len(envs) == 1 {
+					if env, ok := envs[0].(map[string]any); ok && env["Key"] == "SKILL_SPACE_ID" {
+						createdSkillSpace, _ = env["Value"].(string)
+					}
+				}
 				mu.Unlock()
 				respond(map[string]any{"Result": map[string]any{"SessionId": "remote-1", "Status": "Ready"}})
 			case "GetSession":
@@ -108,8 +115,9 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/sandbox/v1/skills":
-			catalogPaths = append([]string(nil), r.URL.Query()["path"]...)
-			respond(map[string]any{"success": true, "data": map[string]any{"skills": []any{map[string]any{"name": "demo", "description": "Demo Skill", "path": "/workspace/skills/demo/SKILL.md"}}}})
+			catalogCalls++
+			t.Error("sandbox Skill catalog must not be queried")
+			w.WriteHeader(http.StatusNotFound)
 		case "/sandbox/v1/file/read":
 			file, _ := body["file"].(string)
 			content := "first\nsecond\n"
@@ -156,28 +164,31 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 	t.Setenv("AGENTKIT_TOOL_SERVICE_CODE", "agentkit")
 	t.Setenv("AGENTKIT_TOOL_REGION", "cn-beijing")
 	ctx := &aioTestContext{state: &aioTestState{values: map[string]any{}}, app: "app", user: "user", id: "session"}
-	if _, err := agentkit.EnsureAIOSandbox(ctx); err != nil {
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := agentkit.EnsureAIOSandbox(ctx); err != nil {
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
 		t.Fatal(err)
 	}
-	if creates != 1 {
-		t.Fatalf("CreateSession calls = %d, want 1", creates)
+	if creates != 1 || createdSkillSpace != "ss-demo" {
+		t.Fatalf("CreateSession calls = %d, SKILL_SPACE_ID = %q", creates, createdSkillSpace)
+	}
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-other"}); err == nil {
+		t.Fatal("binding was reused with a different Skill Space")
 	}
 	other := &aioTestContext{state: ctx.state, app: "app", user: "another", id: "session"}
 	if _, err := agentkit.ResolveAIOEndpoint(other); err == nil {
 		t.Fatal("cross-user binding was accepted")
 	}
-	s, err := NewAIOSandboxToolset([]string{"/workspace/skills", "/other/skills"})
+	s, err := NewAIOSandboxToolset([]skills.RemoteSkill{{Name: "demo", Description: "Demo Skill", Version: "v1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.listSkills(ctx, listSkillsArgs{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(catalogPaths) != 2 {
-		t.Fatalf("catalog path args = %v", catalogPaths)
+	if catalogCalls != 0 {
+		t.Fatalf("sandbox catalog calls = %d, want 0", catalogCalls)
 	}
 	loaded, err := s.loadSkill(ctx, loadSkillArgs{Name: "demo"})
 	if err != nil || !strings.Contains(fmt.Sprint(loaded["instructions"]), "Base directory for this skill: /workspace/skills/demo") {
@@ -283,7 +294,7 @@ func TestAIOClientDoesNotFollowRedirectWithCredential(t *testing.T) {
 	defer server.Close()
 	u, _ := url.Parse(server.URL)
 	client := &aioClient{base: u, client: aioHTTPClient, headers: http.Header{"X-Api-Key": {"secret"}}}
-	if _, err := client.call(context.Background(), "POST", "/v1/file/write", map[string]any{"file": "/workspace/test"}, nil); err == nil {
+	if _, err := client.call(context.Background(), "POST", "/v1/file/write", map[string]any{"file": "/workspace/test"}); err == nil {
 		t.Fatal("redirect was accepted")
 	}
 	if reached {

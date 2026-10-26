@@ -5,10 +5,16 @@ package llmagent
 
 import (
 	"context"
+	"encoding/json"
 	"iter"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/volcengine/veadk-go/v2/auth/veauth"
+	"github.com/volcengine/veadk-go/v2/skills"
 	"github.com/volcengine/veadk-go/v2/tool/skilltool"
 	"google.golang.org/adk/v2/agent"
 	adkllmagent "google.golang.org/adk/v2/agent/llmagent"
@@ -26,14 +32,33 @@ func (m *aioCountingModel) GenerateContent(context.Context, *adkmodel.LLMRequest
 	return func(func(*adkmodel.LLMResponse, error) bool) {}
 }
 
-func TestAIOSkillsModeDoesNotReadHostPaths(t *testing.T) {
+func TestAIOSkillsModeDiscoversAtConstruction(t *testing.T) {
+	var calls atomic.Int32
+	service := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["SkillSpaceId"] != "ss-test" {
+			t.Errorf("Skill Space request: %v, %v", body, err)
+		}
+		_, _ = w.Write([]byte(`{"Result":{"Items":[{"Name":"demo","Description":"Demo Skill","BucketName":"bucket","TosPath":"demo.zip","Version":"v1"}]}}`))
+	}))
+	defer service.Close()
 	cfg := &Config{
 		Config:     adkllmagent.Config{Name: "aio-agent", Model: testLLM{}},
 		SkillsMode: "aio_sandbox",
-		Skills:     []string{"/a/host/path/that/does/not/exist"},
+		Skills:     []string{"ss-test"},
+		SkillSpaceSourceConfig: skills.RemoteSourceConfig{
+			Endpoint: service.URL,
+			Credentials: veauth.NewRoleCredentialSource(veauth.RoleCredentialSourceConfig{
+				AccessKeyID: "test-ak", SecretAccessKey: "test-sk",
+			}),
+		},
 	}
 	if _, err := New(cfg); err != nil {
-		t.Fatalf("New() inspected a sandbox path on the host: %v", err)
+		t.Fatalf("New() did not discover Skill Space: %v", err)
+	}
+	if calls.Load() != 1 || !strings.Contains(cfg.Instruction, "Demo Skill") || !strings.Contains(cfg.Instruction, "<name>demo</name>") {
+		t.Fatalf("Agent prompt missing startup metadata: calls=%d instruction=%q", calls.Load(), cfg.Instruction)
 	}
 	if len(cfg.Toolsets) != 1 || len(cfg.BeforeAgentCallbacks) != 1 {
 		t.Fatalf("AIO wiring: toolsets=%d callbacks=%d", len(cfg.Toolsets), len(cfg.BeforeAgentCallbacks))
@@ -47,9 +72,10 @@ func TestAIOSkillsModeDoesNotReadHostPaths(t *testing.T) {
 	}
 }
 
-func TestSkillsModeRejectsUnknownAndRelativeSandboxPaths(t *testing.T) {
+func TestSkillsModeRejectsUnknownAndSandboxPaths(t *testing.T) {
 	for _, cfg := range []*Config{
 		{Config: adkllmagent.Config{Name: "unknown", Model: testLLM{}}, SkillsMode: "skills_sandbox"},
+		{Config: adkllmagent.Config{Name: "absolute", Model: testLLM{}}, SkillsMode: "aio_sandbox", Skills: []string{"/workspace/skills"}},
 		{Config: adkllmagent.Config{Name: "relative", Model: testLLM{}}, SkillsMode: "aio_sandbox", Skills: []string{"relative/skills"}},
 	} {
 		if _, err := New(cfg); err == nil {
