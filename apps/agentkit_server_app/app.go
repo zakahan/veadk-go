@@ -18,11 +18,15 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
+	"slices"
 
 	"github.com/gorilla/mux"
+	veagent "github.com/volcengine/veadk-go/v2/agent/llmagent"
 	"github.com/volcengine/veadk-go/v2/apps"
 	"github.com/volcengine/veadk-go/v2/apps/a2a_app"
 	"github.com/volcengine/veadk-go/v2/apps/simple_app"
+	"github.com/volcengine/veadk-go/v2/integrations/agentkit"
 	"github.com/volcengine/veadk-go/v2/log"
 	"github.com/volcengine/veadk-go/v2/observability"
 	"google.golang.org/adk/v2/cmd/launcher"
@@ -36,8 +40,9 @@ const serverName = "agentkit server"
 // allowing embedders to add routes and middleware around the shared router.
 type AgentkitServerApp struct {
 	*apps.ApiConfig
-	routeSetups []RouteSetup
-	middleware  []mux.MiddlewareFunc
+	routeSetups  []RouteSetup
+	middleware   []mux.MiddlewareFunc
+	aioLifecycle *agentkit.AIOLifecycle
 }
 
 // RouteSetup adds application-specific routes after VeADK's exact built-in
@@ -46,6 +51,12 @@ type RouteSetup func(router *mux.Router, config *apps.RunConfig) error
 
 // Option configures AgentkitServerApp extensions.
 type Option func(*AgentkitServerApp)
+
+// WithAIOLifecycle enables session-bound AIO sandbox management for this App.
+// Local-mode apps leave it unset and keep the ADK REST session behavior.
+func WithAIOLifecycle(manager *agentkit.AIOLifecycle) Option {
+	return func(app *AgentkitServerApp) { app.aioLifecycle = manager }
+}
 
 // WithRouteSetup adds one non-nil route setup callback.
 func WithRouteSetup(setup RouteSetup) Option {
@@ -84,6 +95,11 @@ func NewAgentkitServerApp(config *apps.ApiConfig, options ...Option) *AgentkitSe
 }
 
 func (a *AgentkitServerApp) Run(ctx context.Context, config *apps.RunConfig) error {
+	if a.aioLifecycle != nil {
+		workerCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		a.aioLifecycle.Start(workerCtx)
+	}
 	return apps.Run(ctx, config, a)
 }
 
@@ -93,6 +109,17 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	}
 	if config == nil || config.AgentLoader == nil || config.AgentLoader.RootAgent() == nil {
 		return apps.NewSetupError("validate agent loader", fmt.Errorf("root agent is required"))
+	}
+	if mode, ids, known := veagent.SkillsModeFor(config.AgentLoader.RootAgent()); known {
+		if mode == "aio_sandbox" && a.aioLifecycle == nil {
+			return apps.NewSetupError("validate AIO lifecycle", fmt.Errorf("aio_sandbox Agent requires WithAIOLifecycle"))
+		}
+		if a.aioLifecycle != nil && (mode != "aio_sandbox" || !slices.Equal(ids, a.aioLifecycle.SkillSpaceIDs())) {
+			return apps.NewSetupError("validate AIO lifecycle", fmt.Errorf("Agent Skill mode or Skill Space IDs do not match lifecycle configuration"))
+		}
+	}
+	if a.aioLifecycle != nil && !sameSessionService(a.aioLifecycle.SessionService(), config.SessionService) {
+		return apps.NewSetupError("validate AIO lifecycle", fmt.Errorf("App and AIO lifecycle must share SessionService"))
 	}
 	for _, middleware := range a.middleware {
 		router.Use(middleware)
@@ -109,11 +136,19 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 		}
 	}
 
-	//setup a2a routers
-	a2aApp := a2a_app.NewAgentkitA2AServerApp(a.ApiConfig)
-	err = a2aApp.SetupRouters(router, config)
-	if err != nil {
-		return apps.NewSetupError("setup A2A routes", err)
+	// A2A has its own session creation path. Until it participates in the
+	// lifecycle lock, exposing it for AIO would bypass the sandbox contract.
+	if a.aioLifecycle == nil {
+		a2aApp := a2a_app.NewAgentkitA2AServerApp(a.ApiConfig)
+		err = a2aApp.SetupRouters(router, config)
+		if err != nil {
+			return apps.NewSetupError("setup A2A routes", err)
+		}
+	}
+	if a.aioLifecycle != nil {
+		if err := a.setupAIORoutes(router, config); err != nil {
+			return apps.NewSetupError("setup AIO session routes", err)
+		}
 	}
 
 	for _, setup := range a.routeSetups {
@@ -166,6 +201,9 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	}
 
 	var wrappedHandler http.Handler = http.StripPrefix(a.ApiPathPrefix, apiHandler)
+	if a.aioLifecycle != nil {
+		wrappedHandler = a.aioRunHandler(wrappedHandler, config.AgentLoader.RootAgent().Name())
+	}
 	if !config.DisableObservability {
 		wrappedHandler = observability.HTTPMiddleware(wrappedHandler)
 	}
@@ -175,6 +213,14 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	log.Infof("       api:      for instance: %s/list-apps", a.GetAPIPath())
 
 	return nil
+}
+
+func sameSessionService(a, b any) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	left, right := reflect.ValueOf(a), reflect.ValueOf(b)
+	return left.Type() == right.Type() && left.Type().Comparable() && left.Interface() == right.Interface()
 }
 
 func (a *AgentkitServerApp) GetApiConfig() *apps.ApiConfig {

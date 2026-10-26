@@ -54,8 +54,12 @@ func TestAIOSkillsModeDiscoversAtConstruction(t *testing.T) {
 			}),
 		},
 	}
-	if _, err := New(cfg); err != nil {
+	a, err := New(cfg)
+	if err != nil {
 		t.Fatalf("New() did not discover Skill Space: %v", err)
+	}
+	if mode, ids, known := SkillsModeFor(a); !known || mode != "aio_sandbox" || len(ids) != 1 || ids[0] != "ss-test" {
+		t.Fatalf("constructed Agent mode = %q, ids=%v, known=%t", mode, ids, known)
 	}
 	if calls.Load() != 1 || !strings.Contains(cfg.Instruction, "Demo Skill") || !strings.Contains(cfg.Instruction, "<name>demo</name>") || !strings.Contains(cfg.Instruction, "<path>/workspace/skills/demo</path>") {
 		t.Fatalf("Agent prompt missing startup metadata: calls=%d instruction=%q", calls.Load(), cfg.Instruction)
@@ -69,6 +73,16 @@ func TestAIOSkillsModeDiscoversAtConstruction(t *testing.T) {
 	empty := &Config{Config: adkllmagent.Config{Name: "empty-aio-agent", Model: testLLM{}}, SkillsMode: "aio_sandbox"}
 	if _, err := New(empty); err != nil || len(empty.Toolsets) != 1 {
 		t.Fatalf("empty AIO Skills must still install tools: %v", err)
+	}
+}
+
+func TestLocalAgentExposesLocalMode(t *testing.T) {
+	a, err := New(&Config{Config: adkllmagent.Config{Name: "local-agent", Model: testLLM{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode, _, known := SkillsModeFor(a); !known || mode != "local" {
+		t.Fatalf("constructed local Agent mode = %q, known=%t", mode, known)
 	}
 }
 

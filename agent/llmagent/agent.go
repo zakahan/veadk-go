@@ -43,6 +43,24 @@ import (
 )
 
 var longTermMemoryByAgent sync.Map
+var skillModeByAgent sync.Map
+
+type skillModeSelection struct {
+	mode string
+	ids  []string
+}
+
+// SkillsModeFor reports the mode selected when a VeADK LlmAgent was built.
+// Generic ADK agents have no registered mode.
+func SkillsModeFor(a agent.Agent) (string, []string, bool) {
+	value, ok := skillModeByAgent.Load(a)
+	if !ok {
+		return "", nil, false
+	}
+	selection := value.(skillModeSelection)
+	return selection.mode, append([]string(nil), selection.ids...), true
+}
+
 var aioSkillSpaceID = regexp.MustCompile(`^ss-[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 type Config struct {
@@ -204,6 +222,15 @@ func New(cfg *Config) (agent.Agent, error) {
 	if cfg.LongTermMemory != nil {
 		longTermMemoryByAgent.Store(a, cfg.LongTermMemory)
 	}
+	mode := cfg.SkillsMode
+	if mode == "" {
+		mode = "local"
+	}
+	selection := skillModeSelection{mode: mode}
+	if mode == "aio_sandbox" {
+		selection.ids = append([]string(nil), cfg.Skills...)
+	}
+	skillModeByAgent.Store(a, selection)
 	return a, nil
 }
 

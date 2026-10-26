@@ -17,6 +17,7 @@ package agentkit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -48,6 +49,16 @@ type Client struct {
 	Scheme  string
 
 	DoRequest DoRequestFunc
+}
+
+// APIError preserves the control-plane error code so lifecycle operations can
+// distinguish an absent session from a transient failure.
+type APIError struct {
+	Action, Code, RequestID string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("AgentKit %s rejected the request: %s (request_id=%s)", e.Action, e.Code, e.RequestID)
 }
 
 type Option func(*Client)
@@ -110,6 +121,10 @@ func (c *Client) DoContext(ctx context.Context, action string, body map[string]a
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	})
 	if err != nil {
+		var httpErr *ve_sign.HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound && (action == "GetSession" || action == "DeleteSession") {
+			return nil, &APIError{Action: action, Code: "InvalidResource.NotFound"}
+		}
 		return nil, fmt.Errorf("AgentKit %s request failed: %w", action, err)
 	}
 	var response map[string]any
@@ -117,7 +132,12 @@ func (c *Client) DoContext(ctx context.Context, action string, body map[string]a
 		return nil, fmt.Errorf("AgentKit %s returned invalid JSON: %w", action, err)
 	}
 	if metadata, ok := response["ResponseMetadata"].(map[string]any); ok && metadata["Error"] != nil {
-		return nil, fmt.Errorf("AgentKit %s rejected the request", action)
+		apiErr := &APIError{Action: action}
+		apiErr.RequestID, _ = metadata["RequestId"].(string)
+		if detail, ok := metadata["Error"].(map[string]any); ok {
+			apiErr.Code, _ = detail["Code"].(string)
+		}
+		return nil, apiErr
 	}
 	return response, nil
 }

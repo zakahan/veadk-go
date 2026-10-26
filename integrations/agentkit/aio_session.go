@@ -72,6 +72,18 @@ func bindingFromState(state session.ReadonlyState) (*AIOBinding, error) {
 	return &binding, nil
 }
 
+func bindingValue(binding AIOBinding) map[string]string {
+	return map[string]string{
+		"tool_id": binding.ToolID, "session_id": binding.SessionID,
+		"identity": binding.Identity, "skill_space_ids": binding.SkillSpaceIDs,
+	}
+}
+
+func isMissingAIOSession(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == "InvalidResource.NotFound"
+}
+
 func aioToolID() string { return strings.TrimSpace(os.Getenv("AGENTKIT_TOOL_ID")) }
 
 // EnsureAIOSandbox binds an ADK session before any model or tool execution.
@@ -104,6 +116,10 @@ func EnsureAIOBinding(ctx context.Context, client *Client, state session.State, 
 
 // EnsureAIOBindingWithSkills is also available to session-creation handlers.
 func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state session.State, appName, userID, sessionID string, skillSpaceIDs []string) (*AIOBinding, error) {
+	return ensureAIOBindingWithSkillsTTL(ctx, client, state, appName, userID, sessionID, skillSpaceIDs, aioSessionTTL)
+}
+
+func ensureAIOBindingWithSkillsTTL(ctx context.Context, client *Client, state session.State, appName, userID, sessionID string, skillSpaceIDs []string, ttlSeconds int) (*AIOBinding, error) {
 	if ctx == nil || client == nil || state == nil || appName == "" || userID == "" || sessionID == "" {
 		return nil, errors.New("AIO sandbox requires client, state, app, user and session identity")
 	}
@@ -117,16 +133,19 @@ func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state sessi
 	lock := &aioSessionLocks[int(sum[0])%len(aioSessionLocks)]
 	lock.Lock()
 	defer lock.Unlock()
+	var staleID string
 	if existing, err := bindingFromState(state); err != nil {
 		return nil, err
 	} else if existing != nil {
 		if existing.Identity != identity || existing.ToolID != toolID || existing.SkillSpaceIDs != skillSpaceValue {
 			return nil, errors.New("AIO sandbox binding does not match this session")
 		}
-		if _, err := readyAIOSession(ctx, client, *existing); err != nil {
+		if _, err := readyAIOSessionTTL(ctx, client, *existing, ttlSeconds); err == nil {
+			return existing, nil
+		} else if !isMissingAIOSession(err) && !errors.Is(err, errExpiredAIOSession) {
 			return nil, err
 		}
-		return existing, nil
+		staleID = existing.SessionID
 	}
 	userSessionID := aioPhysicalPrefix(identity, skillSpaceValue)
 	candidates, err := listAIOSessions(ctx, client, toolID, userSessionID)
@@ -136,11 +155,14 @@ func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state sessi
 	var chosen *aioSession
 	for i := range candidates {
 		candidate := &candidates[i]
+		if candidate.ID == staleID {
+			continue
+		}
 		if candidate.UserID != userSessionID && !strings.HasPrefix(candidate.UserID, userSessionID+"_r_") {
 			continue
 		}
 		status := strings.ToLower(candidate.Status)
-		if status != "ready" && status != "starting" {
+		if status != "ready" && status != "starting" && status != "paused" && status != "pausing" {
 			continue
 		}
 		if expired(candidate.ExpireAt) {
@@ -161,7 +183,7 @@ func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state sessi
 			hash := sha256.Sum256(data)
 			physicalID += "_r_" + hex.EncodeToString(hash[:6])
 		}
-		body := map[string]any{"ToolId": toolID, "UserSessionId": physicalID, "Ttl": aioSessionTTL}
+		body := map[string]any{"ToolId": toolID, "UserSessionId": physicalID, "Ttl": ttlSeconds}
 		if skillSpaceValue != "" {
 			body["Envs"] = []map[string]string{{"Key": "SKILL_SPACE_ID", "Value": skillSpaceValue}}
 		}
@@ -177,7 +199,7 @@ func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state sessi
 				return nil, fmt.Errorf("CreateSession result unknown: %w", createErr)
 			}
 			for i := range recovered {
-				if recovered[i].UserID == physicalID && (strings.EqualFold(recovered[i].Status, "ready") || strings.EqualFold(recovered[i].Status, "starting")) {
+				if recovered[i].UserID == physicalID && (strings.EqualFold(recovered[i].Status, "ready") || strings.EqualFold(recovered[i].Status, "starting") || strings.EqualFold(recovered[i].Status, "paused")) {
 					chosen = &recovered[i]
 					break
 				}
@@ -191,16 +213,16 @@ func EnsureAIOBindingWithSkills(ctx context.Context, client *Client, state sessi
 		return nil, errors.New("AgentKit session response has no SessionId")
 	}
 	binding := &AIOBinding{ToolID: toolID, SessionID: chosen.ID, Identity: identity, SkillSpaceIDs: skillSpaceValue}
-	if _, err := readyAIOSession(ctx, client, *binding); err != nil {
+	if _, err := readyAIOSessionTTL(ctx, client, *binding, ttlSeconds); err != nil {
 		return nil, err
 	}
-	if err := state.Set(AIOSandboxStateKey, map[string]string{
-		"tool_id": toolID, "session_id": chosen.ID, "identity": identity, "skill_space_ids": skillSpaceValue,
-	}); err != nil {
+	if err := state.Set(AIOSandboxStateKey, bindingValue(*binding)); err != nil {
 		return nil, fmt.Errorf("persist AIO sandbox binding: %w", err)
 	}
 	return binding, nil
 }
+
+var errExpiredAIOSession = errors.New("bound AIO sandbox has expired")
 
 // ResolveAIOEndpoint validates an existing binding. Missing or expired
 // bindings never create a new empty sandbox.
@@ -242,9 +264,111 @@ func ResolveAIOEndpointFor(ctx context.Context, client *Client, state session.Re
 	return endpoint, nil
 }
 
-func readyAIOSession(ctx context.Context, client *Client, binding AIOBinding) (*aioSession, error) {
+func checkedAIOBinding(state session.ReadonlyState, appName, userID, sessionID string) (*AIOBinding, error) {
+	binding, err := bindingFromState(state)
+	if err != nil {
+		return nil, err
+	}
+	if binding == nil || binding.Identity != aioIdentity(appName, userID, sessionID) || binding.ToolID != aioToolID() {
+		return nil, errors.New("AIO sandbox is not bound to this session")
+	}
+	return binding, nil
+}
+
+// PauseAIOBinding pauses a physical sandbox and confirms its final state.
+func PauseAIOBinding(ctx context.Context, client *Client, state session.ReadonlyState, appName, userID, sessionID string) error {
+	binding, err := checkedAIOBinding(state, appName, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	check := func(checkCtx context.Context) (string, error) {
+		response, err := client.DoContext(checkCtx, "GetSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+		if err != nil {
+			return "", err
+		}
+		info := parseAIOSession(response)
+		if info.ID != binding.SessionID || info.UserID != aioPhysicalPrefix(binding.Identity, binding.SkillSpaceIDs) && !strings.HasPrefix(info.UserID, aioPhysicalPrefix(binding.Identity, binding.SkillSpaceIDs)+"_r_") {
+			return "", errors.New("bound AIO sandbox belongs to another ADK session")
+		}
+		return strings.ToLower(info.Status), nil
+	}
+	status, err := check(ctx)
+	if err != nil {
+		return err
+	}
+	if status == "paused" {
+		return nil
+	}
+	if status != "ready" && status != "pausing" {
+		return fmt.Errorf("AIO sandbox cannot pause from %s", status)
+	}
+	if status == "ready" {
+		_, err = client.DoContext(ctx, "PauseSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	for {
+		status, checkErr := check(waitCtx)
+		if checkErr == nil && status == "paused" {
+			return nil
+		}
+		if checkErr != nil || (status != "ready" && status != "pausing") {
+			if err != nil {
+				return fmt.Errorf("pause AIO sandbox: %w", err)
+			}
+			if checkErr != nil {
+				return checkErr
+			}
+			return fmt.Errorf("AIO sandbox changed to %s while pausing", status)
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// DeleteAIOBinding confirms deletion of the physical sandbox. It does not
+// delete the ADK session or its conversation history.
+func DeleteAIOBinding(ctx context.Context, client *Client, state session.ReadonlyState, appName, userID, sessionID string) error {
+	binding, err := checkedAIOBinding(state, appName, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	_, err = client.DoContext(ctx, "DeleteSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+	if isMissingAIOSession(err) {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	for {
+		result, checkErr := client.DoContext(waitCtx, "GetSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+		if isMissingAIOSession(checkErr) || checkErr == nil && strings.EqualFold(parseAIOSession(result).Status, "deleted") {
+			return nil
+		}
+		if checkErr != nil {
+			return checkErr
+		}
+		if err != nil && !strings.EqualFold(parseAIOSession(result).Status, "terminating") {
+			return fmt.Errorf("delete AIO sandbox result unknown: %w", err)
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func readyAIOSession(ctx context.Context, client *Client, binding AIOBinding) (*aioSession, error) {
+	return readyAIOSessionTTL(ctx, client, binding, aioSessionTTL)
+}
+
+func readyAIOSessionTTL(ctx context.Context, client *Client, binding AIOBinding, ttlSeconds int) (*aioSession, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	resumeRequested := false
 	for {
 		result, err := client.DoContext(waitCtx, "GetSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
 		if err != nil {
@@ -259,7 +383,7 @@ func readyAIOSession(ctx context.Context, client *Client, binding AIOBinding) (*
 			return nil, errors.New("bound AIO sandbox belongs to another ADK session")
 		}
 		if expired(info.ExpireAt) {
-			return nil, errors.New("bound AIO sandbox has expired")
+			return nil, errExpiredAIOSession
 		}
 		switch strings.ToLower(info.Status) {
 		case "ready":
@@ -268,6 +392,24 @@ func readyAIOSession(ctx context.Context, client *Client, binding AIOBinding) (*
 			}
 			return &info, nil
 		case "starting":
+		case "paused":
+			if resumeRequested {
+				break
+			}
+			resumeRequested = true
+			_, resumeErr := client.DoContext(waitCtx, "ResumeSession", map[string]any{
+				"ToolId": binding.ToolID, "SessionId": binding.SessionID,
+				"Ttl": ttlSeconds, "TtlUnit": "second",
+			})
+			if resumeErr != nil {
+				// A timed-out write may have succeeded. Observe the resource before
+				// deciding whether the operation failed.
+				result, getErr := client.DoContext(waitCtx, "GetSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+				if getErr != nil || strings.EqualFold(parseAIOSession(result).Status, "paused") {
+					return nil, fmt.Errorf("resume bound AIO sandbox: %w", resumeErr)
+				}
+			}
+		case "pausing", "resuming":
 		default:
 			return nil, fmt.Errorf("bound AIO sandbox is %s", info.Status)
 		}
