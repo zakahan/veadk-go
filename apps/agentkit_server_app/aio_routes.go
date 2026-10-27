@@ -32,12 +32,14 @@ func (a *AgentkitServerApp) setupAIORoutes(router *mux.Router, cfg *apps.RunConf
 			return
 		}
 		var body struct {
-			SessionID string            `json:"session_id"`
+			SessionID string            `json:"sessionId"`
 			State     map[string]any    `json:"state"`
 			Events    []json.RawMessage `json:"events"`
 		}
 		if r.ContentLength != 0 {
-			if err := json.NewDecoder(io.LimitReader(r.Body, 20<<20)).Decode(&body); err != nil {
+			decoder := json.NewDecoder(io.LimitReader(r.Body, 20<<20))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&body); err != nil && err != io.EOF {
 				http.Error(w, "invalid session request", http.StatusBadRequest)
 				return
 			}
@@ -189,14 +191,10 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 				http.Error(w, "invalid run request", http.StatusBadRequest)
 				return
 			}
-			for alias, canonical := range map[string]string{"app_name": "appName", "user_id": "userId", "session_id": "sessionId", "new_message": "newMessage", "state_delta": "stateDelta"} {
-				if value, ok := body[alias]; ok {
-					if _, duplicate := body[canonical]; duplicate {
-						http.Error(w, "duplicate run field", http.StatusUnprocessableEntity)
-						return
-					}
-					body[canonical] = value
-					delete(body, alias)
+			for _, name := range []string{"app_name", "user_id", "session_id", "new_message", "state_delta", "function_call_event_id", "model_name", "thinking_level"} {
+				if _, ok := body[name]; ok {
+					http.Error(w, "unknown run field "+name, http.StatusBadRequest)
+					return
 				}
 			}
 			if raw := body["stateDelta"]; len(raw) != 0 {
@@ -213,9 +211,7 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 			_ = json.Unmarshal(body["appName"], &app)
 			_ = json.Unmarshal(body["userId"], &user)
 			_ = json.Unmarshal(body["sessionId"], &id)
-			data, _ = json.Marshal(body)
 			r.Body = io.NopCloser(bytes.NewReader(data))
-			r.ContentLength = int64(len(data))
 		}
 		if app != root || user == "" || id == "" {
 			http.Error(w, "unknown app or missing session identity", http.StatusNotFound)

@@ -77,9 +77,13 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 		router.ServeHTTP(w, r)
 		return w
 	}
-	created := call(http.MethodPost, "/api/apps/aio/users/user/sessions", []byte(`{"session_id":"logical","state":{"x":1}}`))
+	created := call(http.MethodPost, "/api/apps/aio/users/user/sessions", []byte(`{"sessionId":"logical","state":{"x":1}}`))
 	if created.Code != http.StatusOK || strings.Contains(created.Body.String(), agentkit.AIOSandboxStateKey) || createCalls != 1 {
 		t.Fatalf("create = %d %s; calls=%d", created.Code, created.Body.String(), createCalls)
+	}
+	oldName := call(http.MethodPost, "/api/apps/aio/users/user/sessions", []byte(`{"session_id":"another"}`))
+	if oldName.Code != http.StatusBadRequest || createCalls != 1 {
+		t.Fatalf("snake_case session_id was accepted: %d; creates=%d", oldName.Code, createCalls)
 	}
 	got := call(http.MethodGet, "/api/apps/aio/users/user/sessions/logical", nil)
 	if got.Code != http.StatusOK || strings.Contains(got.Body.String(), agentkit.AIOSandboxStateKey) {
@@ -88,6 +92,10 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 	bad := call(http.MethodPost, "/api/run_sse", []byte(`{"appName":"aio","userId":"user","sessionId":"logical","newMessage":{"role":"user","parts":[{"text":"hello"}]},"stateDelta":{"_veadk_aio_sandbox":{}}}`))
 	if bad.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("reserved state delta status = %d", bad.Code)
+	}
+	badName := call(http.MethodPost, "/api/run_sse", []byte(`{"app_name":"aio","userId":"user","sessionId":"logical"}`))
+	if badName.Code != http.StatusBadRequest {
+		t.Fatalf("snake_case app_name was accepted: %d", badName.Code)
 	}
 	api := httptest.NewServer(router)
 	defer api.Close()
