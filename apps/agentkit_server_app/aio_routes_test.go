@@ -22,6 +22,41 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
+func TestAIORunBodyLimit(t *testing.T) {
+	body := `{"newMessage":{"role":"user","parts":[{"text":"` + strings.Repeat("x", 21<<20) + `"}]}}`
+	for _, path := range []string{"/run", "/run_sse"} {
+		for _, limited := range []bool{false, true} {
+			name := path + "/unlimited"
+			if limited {
+				name = path + "/configured-limit"
+			}
+			t.Run(name, func(t *testing.T) {
+				forwarded := false
+				next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					forwarded = true
+					got, err := io.ReadAll(r.Body)
+					if err != nil || string(got) != body {
+						t.Fatal("forwarded body changed")
+					}
+					w.WriteHeader(http.StatusNoContent)
+				})
+				app := &AgentkitServerApp{ApiConfig: &apps.ApiConfig{}}
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				response := httptest.NewRecorder()
+				want := http.StatusNoContent
+				if limited {
+					req.Body = http.MaxBytesReader(response, req.Body, 20<<20)
+					want = http.StatusRequestEntityTooLarge
+				}
+				app.aioRunHandler(next, nil).ServeHTTP(response, req)
+				if response.Code != want || forwarded == limited {
+					t.Fatalf("status=%d forwarded=%v, want status=%d forwarded=%v", response.Code, forwarded, want, !limited)
+				}
+			})
+		}
+	}
+}
+
 func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 	var userSessionID string
 	var status = "Ready"

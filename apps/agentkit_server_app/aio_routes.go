@@ -39,8 +39,13 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, loader agent.Loader
 				id = r.URL.Query().Get("session_id")
 			}
 		} else {
-			data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 20<<20))
+			data, err := io.ReadAll(r.Body)
 			if err != nil {
+				var large *http.MaxBytesError
+				if errors.As(err, &large) {
+					http.Error(w, "run request exceeds configured body limit", http.StatusRequestEntityTooLarge)
+					return
+				}
 				http.Error(w, "invalid run request", http.StatusBadRequest)
 				return
 			}
