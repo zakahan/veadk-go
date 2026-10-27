@@ -5,166 +5,24 @@ package agentkit_server_app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/volcengine/veadk-go/v2/apps"
 	"github.com/volcengine/veadk-go/v2/integrations/agentkit"
-	"google.golang.org/adk/v2/session"
+	"github.com/volcengine/veadk-go/v2/log"
+	"google.golang.org/adk/v2/agent"
 )
 
-func (a *AgentkitServerApp) setupAIORoutes(router *mux.Router, cfg *apps.RunConfig) error {
-	if cfg.SessionService == nil {
-		return errors.New("AIO session routes require SessionService")
-	}
-	root := cfg.AgentLoader.RootAgent().Name()
-	prefix := strings.TrimRight(a.ApiPathPrefix, "/")
-	base := prefix + "/apps/{app_name}/users/{user_id}/sessions"
-	create := func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		if vars["app_name"] != root || vars["user_id"] == "" {
-			http.Error(w, "unknown app or user", http.StatusNotFound)
-			return
-		}
-		var body struct {
-			SessionID string            `json:"sessionId"`
-			State     map[string]any    `json:"state"`
-			Events    []json.RawMessage `json:"events"`
-		}
-		if r.ContentLength != 0 {
-			decoder := json.NewDecoder(io.LimitReader(r.Body, 20<<20))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&body); err != nil && err != io.EOF {
-				http.Error(w, "invalid session request", http.StatusBadRequest)
-				return
-			}
-		}
-		id := vars["session_id"]
-		if id != "" && body.SessionID != "" && id != body.SessionID {
-			http.Error(w, "conflicting session IDs", http.StatusUnprocessableEntity)
-			return
-		}
-		if id == "" {
-			id = body.SessionID
-		}
-		created, err := a.aioLifecycle.Create(r.Context(), vars["app_name"], vars["user_id"], id, body.State)
-		if err != nil {
-			if errors.Is(err, agentkit.ErrAIOSessionExists) {
-				http.Error(w, err.Error(), http.StatusConflict)
-				return
-			}
-			http.Error(w, "AIO session creation failed: "+err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		for _, raw := range body.Events {
-			var event session.Event
-			var fields map[string]json.RawMessage
-			decodeErr := json.Unmarshal(raw, &fields)
-			if decodeErr == nil && fields == nil {
-				decodeErr = errors.New("event must be an object")
-			}
-			if decodeErr == nil {
-				if stamp, ok := fields["timestamp"]; ok {
-					var seconds float64
-					decodeErr = json.Unmarshal(stamp, &seconds)
-					if decodeErr == nil {
-						whole := int64(seconds)
-						event.Timestamp = time.Unix(whole, int64((seconds-float64(whole))*1e9))
-					}
-					delete(fields, "timestamp")
-				}
-			}
-			if decodeErr == nil {
-				var remainder []byte
-				remainder, decodeErr = json.Marshal(fields)
-				if decodeErr == nil {
-					decodeErr = json.Unmarshal(remainder, &event)
-				}
-			}
-			if event.Timestamp.IsZero() {
-				event.Timestamp = time.Now()
-			}
-			_, forbidden := event.Actions.StateDelta[agentkit.AIOSandboxStateKey]
-			if decodeErr != nil || forbidden {
-				_ = a.aioLifecycle.Delete(r.Context(), created.AppName(), created.UserID(), created.ID())
-				http.Error(w, "invalid initial event", http.StatusUnprocessableEntity)
-				return
-			}
-			if err := cfg.SessionService.AppendEvent(r.Context(), created, &event); err != nil {
-				_ = a.aioLifecycle.Delete(r.Context(), created.AppName(), created.UserID(), created.ID())
-				http.Error(w, "save initial event failed", http.StatusServiceUnavailable)
-				return
-			}
-		}
-		writeADKSession(w, created)
-	}
-	router.HandleFunc(base, create).Methods(http.MethodPost)
-	router.HandleFunc(base+"/{session_id}", create).Methods(http.MethodPost)
-	router.HandleFunc(base+"/{session_id}", func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		if vars["app_name"] != root {
-			http.Error(w, "unknown app", http.StatusNotFound)
-			return
-		}
-		got, err := cfg.SessionService.Get(r.Context(), &session.GetRequest{
-			AppName: vars["app_name"], UserID: vars["user_id"], SessionID: vars["session_id"],
-		})
-		if err != nil {
-			http.Error(w, "session not found", http.StatusNotFound)
-			return
-		}
-		writeADKSession(w, got.Session)
-	}).Methods(http.MethodGet)
-	router.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		if vars["app_name"] != root {
-			http.Error(w, "unknown app", http.StatusNotFound)
-			return
-		}
-		listed, err := cfg.SessionService.List(r.Context(), &session.ListRequest{AppName: vars["app_name"], UserID: vars["user_id"]})
-		if err != nil {
-			http.Error(w, "list sessions failed", http.StatusServiceUnavailable)
-			return
-		}
-		items := make([]any, 0, len(listed.Sessions))
-		for _, item := range listed.Sessions {
-			items = append(items, adkSessionValue(item))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(items)
-	}).Methods(http.MethodGet)
-	router.HandleFunc(base+"/{session_id}", func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		if vars["app_name"] != root {
-			http.Error(w, "unknown app", http.StatusNotFound)
-			return
-		}
-		err := a.aioLifecycle.Delete(r.Context(), vars["app_name"], vars["user_id"], vars["session_id"])
-		if err != nil {
-			writeAIOError(w, err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, "null\n")
-	}).Methods(http.MethodDelete)
-	return nil
-}
-
-// aioRunHandler validates identity and holds the lifecycle lock until the ADK
+// aioRunHandler protects reserved state and holds the lifecycle lock until the ADK
 // handler has finished, including the final SSE frame.
-func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.Handler {
+func (a *AgentkitServerApp) aioRunHandler(next http.Handler, loader agent.Loader) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a.aioLifecycle == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
 		path := strings.TrimPrefix(r.URL.Path, strings.TrimRight(a.ApiPathPrefix, "/"))
-		if path != "/run" && path != "/run_sse" && path != "/run_live" {
+		if r.Method == http.MethodOptions || (path != "/run" && path != "/run_sse" && path != "/run_live") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -181,7 +39,7 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 				id = r.URL.Query().Get("session_id")
 			}
 		} else {
-			data, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+			data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 20<<20))
 			if err != nil {
 				http.Error(w, "invalid run request", http.StatusBadRequest)
 				return
@@ -197,7 +55,10 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 					return
 				}
 			}
-			if raw := body["stateDelta"]; len(raw) != 0 {
+			for key, raw := range body {
+				if !strings.EqualFold(key, "stateDelta") {
+					continue
+				}
 				var delta map[string]any
 				if json.Unmarshal(raw, &delta) != nil {
 					http.Error(w, "invalid stateDelta", http.StatusUnprocessableEntity)
@@ -213,14 +74,28 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 			_ = json.Unmarshal(body["sessionId"], &id)
 			r.Body = io.NopCloser(bytes.NewReader(data))
 		}
-		if app != root || user == "" || id == "" {
-			http.Error(w, "unknown app or missing session identity", http.StatusNotFound)
+		if a.aioLifecycle == nil {
+			next.ServeHTTP(w, r)
 			return
 		}
-		if err := a.aioLifecycle.WithSession(r.Context(), app, user, id, func() error {
-			next.ServeHTTP(w, r)
+		if _, err := loader.LoadAgent(app); err != nil || app == "" || user == "" || id == "" {
+			http.Error(w, "unknown app or missing session identifiers", http.StatusNotFound)
+			return
+		}
+		forwarded := false
+		if err := a.aioLifecycle.WithSessionContext(r.Context(), app, user, id, func(ctx context.Context) error {
+			forwarded = true
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return nil
 		}); err != nil {
+			if forwarded {
+				log.Warnf("AIO request ended with lifecycle coordination error: %v", err)
+				if strings.HasPrefix(w.Header().Get("Content-Type"), "text/event-stream") && r.Context().Err() == nil {
+					_, _ = io.WriteString(w, "event: error\ndata: {\"error\":\"session lifecycle bookkeeping failed\"}\n\n")
+					_ = http.NewResponseController(w).Flush()
+				}
+				return
+			}
 			writeAIOError(w, err)
 		}
 	})
@@ -228,58 +103,20 @@ func (a *AgentkitServerApp) aioRunHandler(next http.Handler, root string) http.H
 
 func writeAIOError(w http.ResponseWriter, err error) {
 	status := http.StatusServiceUnavailable
-	if errors.Is(err, agentkit.ErrAIOSessionBusy) {
+	message := "session or sandbox unavailable"
+	switch {
+	case errors.Is(err, agentkit.ErrAIOSessionBusy):
 		status = http.StatusConflict
+		message = "SESSION_BUSY"
+	case errors.Is(err, agentkit.ErrAIOSessionExists):
+		status = http.StatusConflict
+		message = "session already exists"
+	case errors.Is(err, agentkit.ErrAIOSessionNotFound):
+		status = http.StatusNotFound
+		message = "session not found"
+	case errors.Is(err, agentkit.ErrAIOReservedState):
+		status = http.StatusUnprocessableEntity
+		message = "sandbox binding is server-owned"
 	}
-	http.Error(w, err.Error(), status)
-}
-
-func writeADKSession(w http.ResponseWriter, value session.Session) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(adkSessionValue(value))
-}
-
-func adkSessionValue(value session.Session) map[string]any {
-	state := map[string]any{}
-	for key, item := range value.State().All() {
-		if key != agentkit.AIOSandboxStateKey {
-			state[key] = item
-		}
-	}
-	events := make([]any, 0, value.Events().Len())
-	for event := range value.Events().All() {
-		if event.Author != "veadk_lifecycle" {
-			actions := map[string]any{
-				"artifactDelta":              event.Actions.ArtifactDelta,
-				"requestedToolConfirmations": event.Actions.RequestedToolConfirmations,
-				"skipSummarization":          event.Actions.SkipSummarization,
-				"transferToAgent":            event.Actions.TransferToAgent,
-				"escalate":                   event.Actions.Escalate,
-			}
-			if len(event.Actions.StateDelta) > 0 {
-				delta := map[string]any{}
-				for key, item := range event.Actions.StateDelta {
-					if key != agentkit.AIOSandboxStateKey {
-						delta[key] = item
-					}
-				}
-				actions["stateDelta"] = delta
-			}
-			events = append(events, map[string]any{
-				"id": event.ID, "invocationId": event.InvocationID,
-				"author": event.Author, "branch": event.Branch,
-				"timestamp": float64(event.Timestamp.UnixNano()) / 1e9,
-				"content":   event.Content, "partial": event.Partial,
-				"actions": actions, "errorCode": event.ErrorCode,
-				"errorMessage": event.ErrorMessage, "usageMetadata": event.UsageMetadata,
-				"turnComplete": event.TurnComplete, "interrupted": event.Interrupted,
-				"groundingMetadata":  event.GroundingMetadata,
-				"longRunningToolIds": event.LongRunningToolIDs,
-			})
-		}
-	}
-	return map[string]any{
-		"id": value.ID(), "appName": value.AppName(), "userId": value.UserID(),
-		"state": state, "events": events, "lastUpdateTime": value.LastUpdateTime().Unix(),
-	}
+	http.Error(w, message, status)
 }

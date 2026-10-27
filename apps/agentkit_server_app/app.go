@@ -53,7 +53,7 @@ type RouteSetup func(router *mux.Router, config *apps.RunConfig) error
 type Option func(*AgentkitServerApp)
 
 // WithAIOLifecycle enables session-bound AIO sandbox management for this App.
-// Local-mode apps leave it unset and keep the ADK REST session behavior.
+// Local-mode apps leave it unset and use the session extensions without a sandbox.
 func WithAIOLifecycle(manager *agentkit.AIOLifecycle) Option {
 	return func(app *AgentkitServerApp) { app.aioLifecycle = manager }
 }
@@ -95,12 +95,25 @@ func NewAgentkitServerApp(config *apps.ApiConfig, options ...Option) *AgentkitSe
 }
 
 func (a *AgentkitServerApp) Run(ctx context.Context, config *apps.RunConfig) error {
-	if a.aioLifecycle != nil {
-		workerCtx, stop := context.WithCancel(ctx)
-		defer stop()
-		a.aioLifecycle.Start(workerCtx)
+	workerCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	return apps.Run(ctx, config, &runningServerApp{AgentkitServerApp: a, workerCtx: workerCtx})
+}
+
+// Start background mutations only after router/configuration validation succeeds.
+type runningServerApp struct {
+	*AgentkitServerApp
+	workerCtx context.Context
+}
+
+func (a *runningServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
+	if err := a.AgentkitServerApp.SetupRouters(router, config); err != nil {
+		return err
 	}
-	return apps.Run(ctx, config, a)
+	if a.aioLifecycle != nil {
+		a.aioLifecycle.Start(a.workerCtx)
+	}
+	return nil
 }
 
 func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunConfig) error {
@@ -110,7 +123,13 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	if config == nil || config.AgentLoader == nil || config.AgentLoader.RootAgent() == nil {
 		return apps.NewSetupError("validate agent loader", fmt.Errorf("root agent is required"))
 	}
+	if a.aioLifecycle != nil && a.IsSimpleAPIEnabled() {
+		return apps.NewSetupError("validate Simple API", fmt.Errorf("aio_sandbox cannot enable Simple API"))
+	}
 	if mode, ids, known := veagent.SkillsModeFor(config.AgentLoader.RootAgent()); known {
+		if mode == "aio_sandbox" && a.IsSimpleAPIEnabled() {
+			return apps.NewSetupError("validate Simple API", fmt.Errorf("aio_sandbox cannot enable Simple API"))
+		}
 		if mode == "aio_sandbox" && a.aioLifecycle == nil {
 			return apps.NewSetupError("validate AIO lifecycle", fmt.Errorf("aio_sandbox Agent requires WithAIOLifecycle"))
 		}
@@ -120,6 +139,11 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	}
 	if a.aioLifecycle != nil && !sameSessionService(a.aioLifecycle.SessionService(), config.SessionService) {
 		return apps.NewSetupError("validate AIO lifecycle", fmt.Errorf("App and AIO lifecycle must share SessionService"))
+	}
+	if a.aioLifecycle != nil {
+		for _, name := range config.AgentLoader.ListAgents() {
+			a.aioLifecycle.RegisterApp(name)
+		}
 	}
 	for _, middleware := range a.middleware {
 		router.Use(middleware)
@@ -145,10 +169,8 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 			return apps.NewSetupError("setup A2A routes", err)
 		}
 	}
-	if a.aioLifecycle != nil {
-		if err := a.setupAIORoutes(router, config); err != nil {
-			return apps.NewSetupError("setup AIO session routes", err)
-		}
+	if err := a.setupSessionRoutes(router, config); err != nil {
+		return apps.NewSetupError("setup session routes", err)
 	}
 
 	for _, setup := range a.routeSetups {
@@ -201,9 +223,7 @@ func (a *AgentkitServerApp) SetupRouters(router *mux.Router, config *apps.RunCon
 	}
 
 	var wrappedHandler http.Handler = http.StripPrefix(a.ApiPathPrefix, apiHandler)
-	if a.aioLifecycle != nil {
-		wrappedHandler = a.aioRunHandler(wrappedHandler, config.AgentLoader.RootAgent().Name())
-	}
+	wrappedHandler = a.aioRunHandler(wrappedHandler, config.AgentLoader)
 	if !config.DisableObservability {
 		wrappedHandler = observability.HTTPMiddleware(wrappedHandler)
 	}

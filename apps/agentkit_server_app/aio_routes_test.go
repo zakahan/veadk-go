@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"iter"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,11 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 	defer run.Body.Close()
 	if run.StatusCode != http.StatusOK || createCalls != 1 {
 		t.Fatalf("run status = %d; creates=%d", run.StatusCode, createCalls)
+	}
+	// Headers arrive before SSE execution completes. Drain the stream before
+	// expecting the lifecycle lock to be released.
+	if _, err := io.Copy(io.Discard, run.Body); err != nil {
+		t.Fatal(err)
 	}
 	deleted := call(http.MethodDelete, "/api/apps/aio/users/user/sessions/logical", nil)
 	if deleted.Code != http.StatusOK || deleteCalls != 1 {

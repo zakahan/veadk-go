@@ -336,7 +336,25 @@ func DeleteAIOBinding(ctx context.Context, client *Client, state session.Readonl
 	if err != nil {
 		return err
 	}
-	_, err = client.DoContext(ctx, "DeleteSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+	// Observe before every attempt, including retries after an uncertain result.
+	current, getErr := client.DoContext(ctx, "GetSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+	if isMissingAIOSession(getErr) {
+		return nil
+	}
+	if getErr != nil {
+		return getErr
+	}
+	info := parseAIOSession(current)
+	if strings.EqualFold(info.Status, "deleted") {
+		return nil
+	}
+	expected := aioPhysicalPrefix(binding.Identity, binding.SkillSpaceIDs)
+	if info.ID != binding.SessionID || (info.UserID != expected && !strings.HasPrefix(info.UserID, expected+"_r_")) {
+		return errors.New("bound AIO sandbox belongs to another ADK session")
+	}
+	if !strings.EqualFold(info.Status, "terminating") {
+		_, err = client.DoContext(ctx, "DeleteSession", map[string]any{"ToolId": binding.ToolID, "SessionId": binding.SessionID})
+	}
 	if isMissingAIOSession(err) {
 		return nil
 	}

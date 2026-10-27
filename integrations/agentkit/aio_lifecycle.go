@@ -18,11 +18,16 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
-// AIOLifecycleConfig configures one owner of AIO sandbox sessions. A single
-// owner should be started per process; a shared lease is needed across replicas.
+// AIOLifecycleConfig configures AIO sandbox sessions. Persistent deployments
+// must configure Store; every replica must share it and the ADK SessionService.
 type AIOLifecycleConfig struct {
 	SessionService session.Service
-	SkillSpaceIDs  []string
+	// Store persists orchestration state and coordinates replicas. Nil is for
+	// ephemeral single-process deployments with in-memory ADK sessions only.
+	Store AIOLifecycleStore
+	// LeaseTTL defaults to two minutes; leases renew every TTL/3.
+	LeaseTTL      time.Duration
+	SkillSpaceIDs []string
 	// IdleTimeout controls time since the last completed request before pause.
 	// Zero reads VEADK_AIO_IDLE_TIMEOUT, then defaults to five minutes.
 	IdleTimeout time.Duration
@@ -40,17 +45,19 @@ type aioTrackedSession struct {
 	lastActivity  time.Time
 	pausedAt      time.Time
 	deleted       bool
+	pendingFiles  []string
 	mu            sync.Mutex
 }
 
 // AIOLifecycle manages physical AgentKit sessions without owning ADK history.
-// Its registry is process-local. An embedding with multiple replicas must use
-// one scheduler or a distributed lease for each logical ADK session.
+// Store provides restart recovery and cross-replica leases. Without Store the
+// lifecycle is deliberately ephemeral, like ADK InMemoryService.
 type AIOLifecycle struct {
 	cfg     AIOLifecycleConfig
 	mu      sync.Mutex
 	tracked map[string]*aioTrackedSession
 	start   sync.Once
+	apps    map[string]bool
 }
 
 func (m *AIOLifecycle) SkillSpaceIDs() []string {
@@ -76,6 +83,12 @@ func NewAIOLifecycle(cfg AIOLifecycleConfig) (*AIOLifecycle, error) {
 	if cfg.IdleTimeout < 0 || cfg.PausedRetention < 0 || cfg.ScanInterval < 0 {
 		return nil, errors.New("AIO lifecycle durations cannot be negative")
 	}
+	if cfg.LeaseTTL == 0 {
+		cfg.LeaseTTL = 2 * time.Minute
+	}
+	if cfg.LeaseTTL < 3*time.Second {
+		return nil, errors.New("AIO LeaseTTL must be at least 3s")
+	}
 	var err error
 	if cfg.IdleTimeout, err = aioDuration(cfg.IdleTimeout, "VEADK_AIO_IDLE_TIMEOUT", 5*time.Minute); err != nil {
 		return nil, err
@@ -87,7 +100,7 @@ func NewAIOLifecycle(cfg AIOLifecycleConfig) (*AIOLifecycle, error) {
 		return nil, err
 	}
 	cfg.SkillSpaceIDs = append([]string(nil), cfg.SkillSpaceIDs...)
-	return &AIOLifecycle{cfg: cfg, tracked: make(map[string]*aioTrackedSession)}, nil
+	return &AIOLifecycle{cfg: cfg, tracked: make(map[string]*aioTrackedSession), apps: make(map[string]bool)}, nil
 }
 
 func aioDuration(explicit time.Duration, env string, fallback time.Duration) (time.Duration, error) {
@@ -140,18 +153,35 @@ func (m *AIOLifecycle) track(app, user, id string) *aioTrackedSession {
 // binding is included in CreateRequest.State, so database SessionServices can
 // persist it in the same transaction as the ADK session.
 func (m *AIOLifecycle) Create(ctx context.Context, app, user, id string, initialState map[string]any) (session.Session, error) {
+	return m.CreateWithEvents(ctx, app, user, id, initialState, nil)
+}
+
+// CreateWithEvents holds the lifecycle lock through history import and rollback.
+func (m *AIOLifecycle) CreateWithEvents(ctx context.Context, app, user, id string, initialState map[string]any, events []*session.Event) (result session.Session, err error) {
 	if app == "" || user == "" {
 		return nil, errors.New("app and user are required")
 	}
 	if _, ok := initialState[AIOSandboxStateKey]; ok {
-		return nil, errors.New("sandbox binding is server-owned")
+		return nil, ErrAIOReservedState
+	}
+	for _, event := range events {
+		if event == nil {
+			return nil, errors.New("nil initial event")
+		}
+		if _, ok := event.Actions.StateDelta[AIOSandboxStateKey]; ok {
+			return nil, ErrAIOReservedState
+		}
 	}
 	if id == "" {
 		id = uuid.NewString()
 	}
 	entry := m.track(app, user, id)
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	work, finish, lockErr := m.acquire(ctx, entry)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	ctx = work
+	defer finishLease(finish, &err)
 	listed, err := m.cfg.SessionService.List(ctx, &session.ListRequest{AppName: app, UserID: user})
 	if err != nil {
 		return nil, fmt.Errorf("check ADK session ID: %w", err)
@@ -178,20 +208,37 @@ func (m *AIOLifecycle) Create(ctx context.Context, app, user, id string, initial
 		// do not delete a sandbox whose creation ownership may be ambiguous.
 		return nil, fmt.Errorf("create ADK session: %w", err)
 	}
+	for _, event := range events {
+		if err := m.cfg.SessionService.AppendEvent(ctx, created.Session, event); err != nil {
+			cleanup, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if e := DeleteAIOBinding(cleanup, client, created.Session.State(), app, user, id); e == nil {
+				_ = m.cfg.SessionService.Delete(cleanup, &session.DeleteRequest{AppName: app, UserID: user, SessionID: id})
+			}
+			return nil, fmt.Errorf("import session event: %w", err)
+		}
+	}
 	entry.lastActivity = time.Now()
+	entry.deleted = false
+	entry.pausedAt = time.Time{}
 	return created.Session, nil
 }
 
 // EnsureReady validates and resumes or recreates the physical sandbox.
-func (m *AIOLifecycle) EnsureReady(ctx context.Context, app, user, id string) (session.Session, error) {
+func (m *AIOLifecycle) EnsureReady(ctx context.Context, app, user, id string) (result session.Session, err error) {
 	entry := m.track(app, user, id)
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	work, finish, lockErr := m.acquire(ctx, entry)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	ctx = work
+	defer finishLease(finish, &err)
 	return m.ensureReadyLocked(ctx, entry)
 }
 
 func (m *AIOLifecycle) ensureReadyLocked(ctx context.Context, entry *aioTrackedSession) (session.Session, error) {
-	got, err := m.cfg.SessionService.Get(ctx, &session.GetRequest{AppName: entry.app, UserID: entry.user, SessionID: entry.id})
+	value, err := GetADKSession(ctx, m.cfg.SessionService, entry.app, entry.user, entry.id)
+	got := &session.GetResponse{Session: value}
 	if err != nil {
 		return nil, err
 	}
@@ -223,29 +270,40 @@ func (m *AIOLifecycle) ensureReadyLocked(ctx context.Context, entry *aioTrackedS
 
 // WithSession serializes one invocation with pause, resume and deletion.
 // Callers must keep the callback running until the SSE stream has ended.
+// Prefer WithSessionContext for I/O so lease loss cancels that work.
 func (m *AIOLifecycle) WithSession(ctx context.Context, app, user, id string, run func() error) error {
+	return m.WithSessionContext(ctx, app, user, id, func(context.Context) error { return run() })
+}
+
+// WithSessionContext propagates loss of the distributed lease to the handler.
+func (m *AIOLifecycle) WithSessionContext(ctx context.Context, app, user, id string, run func(context.Context) error) (err error) {
 	entry := m.track(app, user, id)
-	if !entry.mu.TryLock() {
-		return ErrAIOSessionBusy
-	}
-	defer entry.mu.Unlock()
-	if _, err := m.ensureReadyLocked(ctx, entry); err != nil {
+	work, finish, err := m.acquire(ctx, entry)
+	if err != nil {
 		return err
 	}
+	defer finishLease(finish, &err)
+	if _, err = m.ensureReadyLocked(work, entry); err != nil {
+		return err
+	}
+	m.cleanupFiles(work, entry)
 	defer func() { entry.lastActivity = time.Now() }()
-	return run()
+	return run(work)
 }
 
 var ErrAIOSessionBusy = errors.New("AIO session is busy")
 
 // Delete removes the physical sandbox before removing the ADK session.
-func (m *AIOLifecycle) Delete(ctx context.Context, app, user, id string) error {
+func (m *AIOLifecycle) Delete(ctx context.Context, app, user, id string) (err error) {
 	entry := m.track(app, user, id)
-	if !entry.mu.TryLock() {
-		return ErrAIOSessionBusy
+	work, finish, err := m.acquire(ctx, entry)
+	if err != nil {
+		return err
 	}
-	defer entry.mu.Unlock()
-	got, err := m.cfg.SessionService.Get(ctx, &session.GetRequest{AppName: app, UserID: user, SessionID: id})
+	ctx = work
+	defer finishLease(finish, &err)
+	value, err := GetADKSession(ctx, m.cfg.SessionService, app, user, id)
+	got := &session.GetResponse{Session: value}
 	if err != nil {
 		return err
 	}
@@ -259,17 +317,17 @@ func (m *AIOLifecycle) Delete(ctx context.Context, app, user, id string) error {
 	if err := m.cfg.SessionService.Delete(ctx, &session.DeleteRequest{AppName: app, UserID: user, SessionID: id}); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	delete(m.tracked, aioTrackKey(app, user, id))
-	m.mu.Unlock()
+	entry.deleted = true
+	entry.pendingFiles = nil
 	return nil
 }
 
-// Start runs the idle lifecycle worker until ctx is cancelled. The registry
-// contains sessions created or used by this owner since process startup.
+// Start runs the idle lifecycle worker until ctx is cancelled. Store and
+// registered apps restore sessions that have not been touched since startup.
 func (m *AIOLifecycle) Start(ctx context.Context) {
 	m.start.Do(func() {
 		go func() {
+			m.Sweep(ctx)
 			ticker := time.NewTicker(m.cfg.ScanInterval)
 			defer ticker.Stop()
 			for {
@@ -287,6 +345,10 @@ func (m *AIOLifecycle) Start(ctx context.Context) {
 // Sweep performs one pass. Failed or ambiguous control-plane writes are
 // revisited on the next pass after observing the actual session status.
 func (m *AIOLifecycle) Sweep(ctx context.Context) {
+	if err := m.restore(ctx); err != nil {
+		lifecycleLog(err)
+		return
+	}
 	m.mu.Lock()
 	entries := make([]*aioTrackedSession, 0, len(m.tracked))
 	for _, entry := range m.tracked {
@@ -294,11 +356,19 @@ func (m *AIOLifecycle) Sweep(ctx context.Context) {
 	}
 	m.mu.Unlock()
 	for _, entry := range entries {
-		if !entry.mu.TryLock() {
+		work, finish, err := m.acquire(ctx, entry)
+		if err != nil {
+			if !errors.Is(err, ErrAIOSessionBusy) {
+				lifecycleLog(err)
+			}
 			continue
 		}
 		func() {
-			defer entry.mu.Unlock()
+			ctx := work
+			defer func() { lifecycleLog(finish()) }()
+			if len(entry.pendingFiles) > 0 && !entry.deleted {
+				m.cleanupFiles(ctx, entry)
+			}
 			now := time.Now()
 			if entry.pausedAt.IsZero() && now.Sub(entry.lastActivity) < m.cfg.IdleTimeout {
 				return
@@ -309,7 +379,8 @@ func (m *AIOLifecycle) Sweep(ctx context.Context) {
 			if !entry.pausedAt.IsZero() && now.Sub(entry.pausedAt) < m.cfg.PausedRetention {
 				return
 			}
-			got, err := m.cfg.SessionService.Get(ctx, &session.GetRequest{AppName: entry.app, UserID: entry.user, SessionID: entry.id})
+			value, err := GetADKSession(ctx, m.cfg.SessionService, entry.app, entry.user, entry.id)
+			got := &session.GetResponse{Session: value}
 			if err != nil {
 				return
 			}
@@ -352,4 +423,23 @@ func (s *aioMapState) All() iter.Seq2[string, any] {
 			}
 		}
 	}
+}
+
+// WithSandbox holds the session lock through the complete transfer and commit.
+func (m *AIOLifecycle) WithSandbox(ctx context.Context, app, user, id string, run func(context.Context, session.Session, string) error) error {
+	return m.WithSessionContext(ctx, app, user, id, func(ctx context.Context) error {
+		s, err := GetADKSession(ctx, m.cfg.SessionService, app, user, id)
+		if err != nil {
+			return err
+		}
+		client, err := m.client()
+		if err != nil {
+			return err
+		}
+		endpoint, err := ResolveAIOEndpointFor(ctx, client, s.State(), app, user, id)
+		if err != nil {
+			return err
+		}
+		return run(ctx, s, endpoint)
+	})
 }
