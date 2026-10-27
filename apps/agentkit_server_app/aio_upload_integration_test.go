@@ -75,8 +75,9 @@ func TestAIOLiveStreamingUpload(t *testing.T) {
 		}
 		return resp.StatusCode, v
 	}
-	code, result := upload("live-flow.bin", maxUploadFile)
-	if code != 201 || result["size_bytes"] != float64(maxUploadFile) {
+	const fileSize int64 = 64 << 20
+	code, result := upload("live-flow.bin", fileSize)
+	if code != 201 || result["size_bytes"] != float64(fileSize) {
 		t.Fatalf("live upload = %d %+v", code, result)
 	}
 	client, err := agentkit.NewClient(nil)
@@ -110,22 +111,19 @@ func TestAIOLiveStreamingUpload(t *testing.T) {
 	defer resp.Body.Close()
 	actual, expected := sha256.New(), sha256.New()
 	n, err := io.Copy(actual, resp.Body)
-	if err != nil || resp.StatusCode != 200 || n != maxUploadFile {
+	if err != nil || resp.StatusCode != 200 || n != fileSize {
 		t.Fatalf("download status=%d bytes=%d", resp.StatusCode, n)
 	}
-	_, _ = io.CopyN(expected, zeroReader{}, maxUploadFile)
+	_, _ = io.CopyN(expected, zeroReader{}, fileSize)
 	if string(actual.Sum(nil)) != string(expected.Sum(nil)) {
 		t.Fatal("download checksum mismatch")
 	}
 	if code, _ := upload("live-flow.bin", 5); code != 409 {
 		t.Fatalf("overwrite = %d", code)
 	}
-	if code, _ := upload("oversized.bin", maxUploadFile+1); code != 413 {
-		t.Fatalf("file limit = %d", code)
-	}
 	current, err := store.Get(ctx, &session.GetRequest{AppName: "test", UserID: "user", SessionID: id})
 	if err != nil || current.Session.Events().Len() != 0 {
 		t.Fatal("upload modified conversation history")
 	}
-	t.Log("real Runtime -> sandbox: chunked 16 MiB, checksum, trailing name, no overwrite, size cap passed")
+	t.Log("real Runtime -> sandbox: chunked 64 MiB, checksum, trailing name, no overwrite passed")
 }

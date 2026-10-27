@@ -261,7 +261,7 @@ func TestUploadStreamsBeforeClientEOFAndHoldsLock(t *testing.T) {
 type zeroReader struct{}
 
 func (zeroReader) Read(b []byte) (int, error) { clear(b); return len(b), nil }
-func TestUploadLimitsNamesAndNoOverwrite(t *testing.T) {
+func TestUploadLargeFileNamesAndNoOverwrite(t *testing.T) {
 	api, files, _ := uploadFixture(t)
 	writeFile := func(mw *multipart.Writer, name string, n int64) {
 		part, _ := mw.CreateFormFile("file", name)
@@ -272,9 +272,8 @@ func TestUploadLimitsNamesAndNoOverwrite(t *testing.T) {
 		body   func(*multipart.Writer)
 		status int
 	}{
-		{"limit", func(m *multipart.Writer) { writeFile(m, "limit.bin", maxUploadFile) }, 201},
-		{"over", func(m *multipart.Writer) { writeFile(m, "too-big.bin", maxUploadFile+1) }, 413},
-		{"duplicate", func(m *multipart.Writer) { writeFile(m, "limit.bin", 5) }, 409},
+		{"large file", func(m *multipart.Writer) { writeFile(m, "large.bin", 32<<20) }, 201},
+		{"duplicate", func(m *multipart.Writer) { writeFile(m, "large.bin", 5) }, 409},
 		{"two files", func(m *multipart.Writer) { writeFile(m, "one.bin", 5); writeFile(m, "two.bin", 5) }, 422},
 		{"late invalid name", func(m *multipart.Writer) { writeFile(m, "valid.bin", 5); _ = m.WriteField("name", "../escape") }, 422},
 		{"path filename", func(m *multipart.Writer) { writeFile(m, "../escape", 5) }, 422},
@@ -293,7 +292,7 @@ func TestUploadLimitsNamesAndNoOverwrite(t *testing.T) {
 		t.Fatalf("staging files leaked: %d", len(files.files))
 	}
 	for p, b := range files.files {
-		if !strings.HasSuffix(p, "/limit.bin") || int64(len(b)) != maxUploadFile {
+		if !strings.HasSuffix(p, "/large.bin") || int64(len(b)) != 32<<20 {
 			t.Fatal("existing file changed")
 		}
 	}
@@ -353,32 +352,78 @@ func TestUploadCancellationCleansStagingAndReleasesSession(t *testing.T) {
 		t.Fatal("cancelled upload left a file")
 	}
 }
-func TestUploadCountsWholeUnknownLengthRequest(t *testing.T) {
+func TestUploadAllowsLargeKnownLengthRequest(t *testing.T) {
 	api, files, _ := uploadFixture(t)
-	reader, writer := io.Pipe()
-	mw := multipart.NewWriter(writer)
-	go func() {
-		p, _ := mw.CreateFormFile("file", "small.bin")
-		_, _ = p.Write([]byte("small"))
-		_ = mw.Close()
-		_, _ = io.CopyN(writer, zeroReader{}, maxUploadRequest)
-		_ = writer.Close()
-	}()
-	req, _ := http.NewRequest("POST", api.URL+sessionBase+"/session/files", reader)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, _ := mw.CreateFormFile("file", "large.bin")
+	_, _ = io.CopyN(part, zeroReader{}, 21<<20)
+	_ = mw.Close()
+	req, _ := http.NewRequest("POST", api.URL+sessionBase+"/session/files", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := api.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 413 {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("epilogue bypassed request limit: %d %s", resp.StatusCode, raw)
+	if resp.StatusCode != 201 {
+		t.Fatalf("large known-length request = %d", resp.StatusCode)
 	}
 	files.mu.Lock()
 	defer files.mu.Unlock()
-	if len(files.files) != 0 {
-		t.Fatal("oversized request committed file")
+	if len(files.files) != 1 {
+		t.Fatal("large request did not commit file")
+	}
+}
+
+func TestUploadWholeRequestWithOptionalBodyLimit(t *testing.T) {
+	for _, limited := range []bool{false, true} {
+		name := "unlimited"
+		if limited {
+			name = "configured limit"
+		}
+		t.Run(name, func(t *testing.T) {
+			api, files, _ := uploadFixture(t)
+			if limited {
+				next := api.Config.Handler
+				wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					r.Body = http.MaxBytesReader(w, r.Body, 20<<20)
+					next.ServeHTTP(w, r)
+				}))
+				defer wrapped.Close()
+				api = wrapped
+			}
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			mw := multipart.NewWriter(writer)
+			go func() {
+				p, _ := mw.CreateFormFile("file", "small.bin")
+				_, _ = p.Write([]byte("small"))
+				_ = mw.Close()
+				_, _ = io.CopyN(writer, zeroReader{}, 20<<20)
+				_ = writer.Close()
+			}()
+			req, _ := http.NewRequest("POST", api.URL+sessionBase+"/session/files", reader)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			resp, err := api.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			wantStatus, wantFiles := 201, 1
+			if limited {
+				wantStatus, wantFiles = 413, 0
+			}
+			if resp.StatusCode != wantStatus {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("large request rejected: %d %s", resp.StatusCode, raw)
+			}
+			files.mu.Lock()
+			defer files.mu.Unlock()
+			if len(files.files) != wantFiles {
+				t.Fatalf("committed files = %d, want %d", len(files.files), wantFiles)
+			}
+		})
 	}
 }
 

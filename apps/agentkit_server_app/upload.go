@@ -24,15 +24,19 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
-const maxUploadFile int64 = 16 << 20
-const maxUploadRequest int64 = 20 << 20
-
 type uploadSource struct {
 	io.Reader
 	close func() error
+	size  int64
 }
 
-func (s uploadSource) Close() error { return s.close() }
+func (s *uploadSource) Read(p []byte) (int, error) {
+	n, err := s.Reader.Read(p)
+	s.size += int64(n)
+	return n, err
+}
+
+func (s *uploadSource) Close() error { return s.close() }
 
 type uploadError struct {
 	status  int
@@ -47,7 +51,7 @@ func uploadName(name string) bool {
 func uploadReadError(err error) error {
 	var large *http.MaxBytesError
 	if errors.As(err, &large) {
-		return &uploadError{413, "upload request exceeds 20 MiB"}
+		return &uploadError{413, "upload request exceeds configured body limit"}
 	}
 	return badUpload("invalid multipart request")
 }
@@ -63,11 +67,6 @@ func (a *AgentkitServerApp) uploadHandler(cfg *apps.RunConfig) http.HandlerFunc 
 			http.Error(w, "unknown app", 404)
 			return
 		}
-		if r.ContentLength > maxUploadRequest {
-			http.Error(w, "upload request exceeds 20 MiB", 413)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxUploadRequest)
 		var result any
 		err := a.aioLifecycle.WithSandbox(r.Context(), v["app_name"], v["user_id"], v["session_id"], func(ctx context.Context, s session.Session, endpoint string) error {
 			ctx, cancel := context.WithCancel(ctx)
@@ -161,18 +160,13 @@ func (a *AgentkitServerApp) uploadHandler(cfg *apps.RunConfig) http.HandlerFunc 
 				}
 				header = header[:n]
 				mimeType = http.DetectContentType(header)
-				limited := &io.LimitedReader{R: io.MultiReader(bytes.NewReader(header), part), N: maxUploadFile + 1}
+				source := &uploadSource{Reader: io.MultiReader(bytes.NewReader(header), part), close: interrupt}
 				if err := a.aioLifecycle.TrackFileCleanup(ctx, staged); err != nil {
 					return err
 				}
 				stagedUsed = true
-				size, e = files.Upload(ctx, staged, uploadSource{limited, interrupt})
+				size, e = files.Upload(ctx, staged, source)
 				uploadUncertain = e != nil
-				consumed := maxUploadFile + 1 - limited.N
-				if consumed > maxUploadFile {
-					cancel()
-					return &uploadError{413, "file exceeds 16 MiB"}
-				}
 				if e != nil {
 					cancel()
 					var large *http.MaxBytesError
@@ -181,14 +175,14 @@ func (a *AgentkitServerApp) uploadHandler(cfg *apps.RunConfig) http.HandlerFunc 
 					}
 					return e
 				}
-				if size != consumed {
+				if size != source.size {
 					return errors.New("sandbox upload size mismatch")
 				}
 			}
 			if !seen["file"] {
 				return badUpload("one file is required")
 			}
-			// Consume the epilogue too: the request cap covers the entire HTTP body.
+			// Consume the epilogue too so any configured global body limit covers it.
 			if _, e := io.Copy(io.Discard, r.Body); e != nil {
 				return uploadReadError(e)
 			}
