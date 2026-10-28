@@ -61,7 +61,7 @@ func TestSessionProtocolPaginationAndADKEvents(t *testing.T) {
 	if w := callSession(router, "POST", sessionBase, `{"sessionId":"s1"}`); w.Code != 409 {
 		t.Fatal(w.Code)
 	}
-	if w := callSession(router, "POST", sessionBase+"/path", `{"sessionId":"body"}`); w.Code != 422 {
+	if w := callSession(router, "POST", sessionBase+"/path", `{"sessionId":"body"}`); w.Code != 400 {
 		t.Fatal(w.Code)
 	}
 	first := jsonObject(t, callSession(router, "GET", sessionBase+"?limit=2", ""))
@@ -137,5 +137,26 @@ func TestReservedRunStateUsesADKCaseInsensitiveFieldDecoding(t *testing.T) {
 	w := callSession(router, "POST", "/api/run", `{"StateDelta":{"_veadk_aio_sandbox":{}}}`)
 	if w.Code != 422 {
 		t.Fatalf("reserved binding accepted through case alias: %d", w.Code)
+	}
+}
+
+func TestPathSessionCreationRejectsBodyID(t *testing.T) {
+	router := sessionRouter(t, session.InMemoryService())
+	for _, body := range []string{`{"sessionId":"path"}`, `{"sessionId":"other"}`, `{"sessionId":""}`, `{"sessionId":null}`, `{"SessionID":"path"}`} {
+		w := callSession(router, "POST", sessionBase+"/path", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: got %d: %s", body, w.Code, w.Body.String())
+		}
+	}
+	if w := callSession(router, "GET", sessionBase+"/path", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("rejected requests created session: %d", w.Code)
+	}
+	w := callSession(router, "POST", sessionBase+"/path", `{"state":{"key":"value"},"events":[{"id":"imported","author":"user","content":{"role":"user","parts":[{"text":"hello"}]}}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	result := jsonObject(t, w)
+	if result["id"] != "path" || result["state"].(map[string]any)["key"] != "value" || len(result["events"].([]any)) != 1 {
+		t.Fatalf("unexpected session: %+v", result)
 	}
 }

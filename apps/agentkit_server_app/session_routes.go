@@ -133,14 +133,23 @@ func (a *AgentkitServerApp) setupSessionRoutes(router *mux.Router, cfg *apps.Run
 			return
 		}
 		v := mux.Vars(r)
-		var body struct {
-			SessionID string            `json:"sessionId"`
-			State     map[string]any    `json:"state"`
-			Events    []adkcompat.Event `json:"events"`
+		type createFields struct {
+			State  map[string]any    `json:"state"`
+			Events []adkcompat.Event `json:"events"`
+		}
+		var body createFields
+		id := v["session_id"]
+		var bodyID string
+		var payload any = &body
+		if id == "" {
+			payload = &struct {
+				*createFields
+				SessionID *string `json:"sessionId"`
+			}{createFields: &body, SessionID: &bodyID}
 		}
 		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 20<<20))
 		d.DisallowUnknownFields()
-		if err := d.Decode(&body); err != nil && err != io.EOF {
+		if err := d.Decode(payload); err != nil && err != io.EOF {
 			http.Error(w, "invalid session request", 400)
 			return
 		}
@@ -167,13 +176,8 @@ func (a *AgentkitServerApp) setupSessionRoutes(router *mux.Router, cfg *apps.Run
 			event.Timestamp = time.Now()
 			events = append(events, event)
 		}
-		id := v["session_id"]
-		if id != "" && body.SessionID != "" && id != body.SessionID {
-			http.Error(w, "conflicting session IDs", 422)
-			return
-		}
 		if id == "" {
-			id = body.SessionID
+			id = bodyID
 		}
 		if id == "" {
 			id = uuid.NewString()
