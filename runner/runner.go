@@ -174,7 +174,7 @@ func SaveSessionToLongTermMemory(ctx context.Context, sessionService session.Ser
 func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.Content, cfg agent.RunConfig, opts ...adkrunner.RunOption) iter.Seq2[*session.Event, error] {
 	if r.aioLifecycle != nil {
 		return func(yield func(*session.Event, error) bool) {
-			err := r.aioLifecycle.WithSession(ctx, r.appName, userID, sessionID, func() error {
+			err := r.aioLifecycle.WithSessionContext(ctx, r.appName, userID, sessionID, func(ctx context.Context) error {
 				for event, runErr := range r.Runner.Run(ctx, userID, sessionID, msg, cfg, opts...) {
 					if !yield(event, runErr) || runErr != nil {
 						break

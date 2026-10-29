@@ -253,8 +253,11 @@ func TestUploadStreamsBeforeClientEOFAndHoldsLock(t *testing.T) {
 	}
 	files.mu.Unlock()
 	s, _ := store.Get(context.Background(), &session.GetRequest{AppName: "test", UserID: "user", SessionID: "session"})
-	if s.Session.Events().Len() != 0 {
-		t.Fatal("upload appended conversation events")
+	if s.Session.Events().Len() != 1 || s.Session.Events().At(0).Author != "veadk_lifecycle" {
+		t.Fatal("upload must only persist its lazy sandbox binding")
+	}
+	if _, err := s.Session.State().Get(agentkit.AIOSandboxStateKey); err != nil {
+		t.Fatal("upload did not persist sandbox binding")
 	}
 }
 

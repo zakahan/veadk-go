@@ -39,7 +39,6 @@ import (
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/loadmemorytool"
-	"google.golang.org/genai"
 )
 
 var longTermMemoryByAgent sync.Map
@@ -84,6 +83,8 @@ type Config struct {
 	Skills                []string
 	SkillDiscoveryOptions skills.DiscoveryOptions
 	// SkillsMode selects local (the default) or session-bound aio_sandbox Skills.
+	// AIO sandboxes are created lazily on bash/file tool use or file upload;
+	// constructing an Agent, listing Skills, and ordinary chat do not start one.
 	SkillsMode string
 	// SkillSpaceSourceConfig optionally overrides the Skill service endpoint,
 	// region or credentials. SpaceID is taken from each entry in Skills.
@@ -105,19 +106,12 @@ func New(cfg *Config) (agent.Agent, error) {
 		if err != nil {
 			return nil, err
 		}
-		toolset, err := skilltool.NewAIOSandboxToolset(metadata)
+		toolset, err := skilltool.NewAIOSandboxToolset(metadata, ids...)
 		if err != nil {
 			return nil, err
 		}
 		aioInstruction = toolset.Instruction()
 		cfg.Toolsets = append(cfg.Toolsets, toolset)
-		cfg.BeforeAgentCallbacks = append([]agent.BeforeAgentCallback{func(ctx agent.Context) (*genai.Content, error) {
-			_, err := agentkit.EnsureAIOSandboxWithSkills(ctx, ids)
-			if err != nil {
-				ctx.EndInvocation()
-			}
-			return nil, err
-		}}, cfg.BeforeAgentCallbacks...)
 	default:
 		return nil, fmt.Errorf("unsupported SkillsMode %q", cfg.SkillsMode)
 	}

@@ -164,23 +164,7 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 	t.Setenv("AGENTKIT_TOOL_SERVICE_CODE", "agentkit")
 	t.Setenv("AGENTKIT_TOOL_REGION", "cn-beijing")
 	ctx := &aioTestContext{state: &aioTestState{values: map[string]any{}}, app: "app", user: "user", id: "session"}
-	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
-		t.Fatal(err)
-	}
-	if creates != 1 || createdSkillSpace != "ss-demo" {
-		t.Fatalf("CreateSession calls = %d, SKILL_SPACE_ID = %q", creates, createdSkillSpace)
-	}
-	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-other"}); err == nil {
-		t.Fatal("binding was reused with a different Skill Space")
-	}
-	other := &aioTestContext{state: ctx.state, app: "app", user: "another", id: "session"}
-	if _, err := agentkit.ResolveAIOEndpoint(other); err == nil {
-		t.Fatal("cross-user binding was accepted")
-	}
-	s, err := NewAIOSandboxToolset([]skills.RemoteSkill{{Name: "demo", Description: "Demo Skill", Version: "v1"}})
+	s, err := NewAIOSandboxToolset([]skills.RemoteSkill{{Name: "demo", Description: "Demo Skill", Version: "v1"}}, "ss-demo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,9 +181,28 @@ func TestAIOSandboxBindingAndTools(t *testing.T) {
 	if catalogCalls != 0 {
 		t.Fatalf("sandbox catalog calls = %d, want 0", catalogCalls)
 	}
+	if creates != 0 {
+		t.Fatal("constructing or listing tools allocated a sandbox")
+	}
 	loaded, err := s.readFile(ctx, readFileArgs{FilePath: "/workspace/skills/demo/SKILL.md", Offset: 1, Limit: 0})
 	if err != nil || !strings.Contains(loaded["content"].(string), "# Demo") {
 		t.Fatalf("read_file SKILL.md = %v, %v", loaded, err)
+	}
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-demo"}); err != nil {
+		t.Fatal(err)
+	}
+	if creates != 1 || createdSkillSpace != "ss-demo" {
+		t.Fatalf("CreateSession calls = %d, SKILL_SPACE_ID = %q", creates, createdSkillSpace)
+	}
+	if _, err := agentkit.EnsureAIOSandboxWithSkills(ctx, []string{"ss-other"}); err == nil {
+		t.Fatal("binding was reused with a different Skill Space")
+	}
+	other := &aioTestContext{state: ctx.state, app: "app", user: "another", id: "session"}
+	if _, err := agentkit.ResolveAIOEndpoint(other); err == nil {
+		t.Fatal("cross-user binding was accepted")
 	}
 	if _, err := s.writeFile(ctx, writeFileArgs{FilePath: "hello.txt", Content: "hello"}); err != nil {
 		t.Fatal(err)

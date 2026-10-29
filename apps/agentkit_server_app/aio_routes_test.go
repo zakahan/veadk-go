@@ -114,11 +114,11 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 		return w
 	}
 	created := call(http.MethodPost, "/api/apps/aio/users/user/sessions", []byte(`{"sessionId":"logical","state":{"x":1}}`))
-	if created.Code != http.StatusOK || strings.Contains(created.Body.String(), agentkit.AIOSandboxStateKey) || createCalls != 1 {
+	if created.Code != http.StatusOK || strings.Contains(created.Body.String(), agentkit.AIOSandboxStateKey) || createCalls != 0 {
 		t.Fatalf("create = %d %s; calls=%d", created.Code, created.Body.String(), createCalls)
 	}
 	oldName := call(http.MethodPost, "/api/apps/aio/users/user/sessions", []byte(`{"session_id":"another"}`))
-	if oldName.Code != http.StatusBadRequest || createCalls != 1 {
+	if oldName.Code != http.StatusBadRequest || createCalls != 0 {
 		t.Fatalf("snake_case session_id was accepted: %d; creates=%d", oldName.Code, createCalls)
 	}
 	got := call(http.MethodGet, "/api/apps/aio/users/user/sessions/logical", nil)
@@ -140,7 +140,7 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer run.Body.Close()
-	if run.StatusCode != http.StatusOK || createCalls != 1 {
+	if run.StatusCode != http.StatusOK || createCalls != 0 {
 		t.Fatalf("run status = %d; creates=%d", run.StatusCode, createCalls)
 	}
 	// Headers arrive before SSE execution completes. Drain the stream before
@@ -149,7 +149,7 @@ func TestAIOSessionRoutesBindAndHideInternalState(t *testing.T) {
 		t.Fatal(err)
 	}
 	deleted := call(http.MethodDelete, "/api/apps/aio/users/user/sessions/logical", nil)
-	if deleted.Code != http.StatusOK || deleteCalls != 1 {
+	if deleted.Code != http.StatusOK || deleteCalls != 0 {
 		t.Fatalf("delete = %d %s; calls=%d", deleted.Code, deleted.Body.String(), deleteCalls)
 	}
 }

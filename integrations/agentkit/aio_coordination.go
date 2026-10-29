@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/volcengine/veadk-go/v2/log"
 	"google.golang.org/adk/v2/session"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,12 @@ type lifecycleContext struct {
 	manager *AIOLifecycle
 	entry   *aioTrackedSession
 	owner   string
+	tools   *aioToolInvocation
+}
+
+type aioToolInvocation struct {
+	mu    sync.Mutex
+	state *aioMapState
 }
 
 func (e *aioTrackedSession) record() AIOLifecycleRecord {
@@ -35,7 +42,7 @@ func (m *AIOLifecycle) acquire(ctx context.Context, e *aioTrackedSession) (conte
 		return nil, nil, ErrAIOSessionBusy
 	}
 	if m.cfg.Store == nil {
-		return context.WithValue(ctx, lifecycleContextKey{}, lifecycleContext{manager: m, entry: e}), func() error { e.mu.Unlock(); return nil }, nil
+		return context.WithValue(ctx, lifecycleContextKey{}, lifecycleContext{manager: m, entry: e, tools: &aioToolInvocation{}}), func() error { e.mu.Unlock(); return nil }, nil
 	}
 	owner := uuid.NewString()
 	r, err := m.cfg.Store.Claim(ctx, e.app, e.user, e.id, owner, m.cfg.LeaseTTL)
@@ -47,7 +54,7 @@ func (m *AIOLifecycle) acquire(ctx context.Context, e *aioTrackedSession) (conte
 		r.LastActivity = e.lastActivity
 	}
 	e.load(r)
-	work, cancel := context.WithCancel(context.WithValue(ctx, lifecycleContextKey{}, lifecycleContext{manager: m, entry: e, owner: owner}))
+	work, cancel := context.WithCancel(context.WithValue(ctx, lifecycleContextKey{}, lifecycleContext{manager: m, entry: e, owner: owner, tools: &aioToolInvocation{}}))
 	stop := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {

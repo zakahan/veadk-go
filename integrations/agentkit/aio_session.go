@@ -224,6 +224,62 @@ func ensureAIOBindingWithSkillsTTL(ctx context.Context, client *Client, state se
 
 var errExpiredAIOSession = errors.New("bound AIO sandbox has expired")
 
+// EnsureAIOToolEndpoint lazily prepares a sandbox when an AIO tool executes.
+// Managed invocations share a binding under the lifecycle lease. Tools persist
+// through ADK state deltas; the lifecycle flushes any remaining binding when
+// execution ends, without invalidating ADK's active database session snapshot.
+func EnsureAIOToolEndpoint(ctx agent.Context, skillSpaceIDs []string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("AIO sandbox requires invocation context")
+	}
+	if lc, ok := ctx.Value(lifecycleContextKey{}).(lifecycleContext); ok {
+		if lc.entry.app != ctx.AppName() || lc.entry.user != ctx.UserID() || lc.entry.id != ctx.SessionID() {
+			return "", errors.New("AIO lifecycle context does not match tool session")
+		}
+		if strings.Join(skillSpaceIDs, ",") != strings.Join(lc.manager.cfg.SkillSpaceIDs, ",") {
+			return "", errors.New("AIO tool Skill Space IDs do not match lifecycle configuration")
+		}
+		lc.tools.mu.Lock()
+		defer lc.tools.mu.Unlock()
+		if lc.tools.state == nil {
+			s, err := GetADKSession(ctx, lc.manager.cfg.SessionService, ctx.AppName(), ctx.UserID(), ctx.SessionID())
+			if err != nil {
+				return "", err
+			}
+			state := &aioMapState{values: map[string]any{}}
+			if binding, err := bindingFromState(s.State()); err != nil {
+				return "", err
+			} else if binding != nil {
+				state.values[AIOSandboxStateKey] = bindingValue(*binding)
+			}
+			lc.tools.state = state
+		}
+		client, err := lc.manager.client()
+		if err != nil {
+			return "", err
+		}
+		binding, err := ensureAIOBindingWithSkillsTTL(ctx, client, lc.tools.state, ctx.AppName(), ctx.UserID(), ctx.SessionID(), skillSpaceIDs, lc.manager.sessionTTLSeconds())
+		if err != nil {
+			return "", err
+		}
+		if err := ctx.State().Set(AIOSandboxStateKey, bindingValue(*binding)); err != nil {
+			return "", err
+		}
+		lc.entry.pausedAt = time.Time{}
+		lc.entry.deleted = false
+		lc.entry.lastActivity = time.Now()
+		return ResolveAIOEndpointFor(ctx, client, lc.tools.state, ctx.AppName(), ctx.UserID(), ctx.SessionID())
+	}
+	if _, err := EnsureAIOSandboxWithSkills(ctx, skillSpaceIDs); err != nil {
+		return "", err
+	}
+	client, err := NewClient(ctx)
+	if err != nil {
+		return "", err
+	}
+	return ResolveAIOEndpointFor(ctx, client, ctx.State(), ctx.AppName(), ctx.UserID(), ctx.SessionID())
+}
+
 // ResolveAIOEndpoint validates an existing binding. Missing or expired
 // bindings never create a new empty sandbox.
 func ResolveAIOEndpoint(ctx agent.Context) (string, error) {

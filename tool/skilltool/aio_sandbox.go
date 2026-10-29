@@ -33,18 +33,19 @@ const aioMaxResponse = 4 << 20
 const aioMaxOutput = 50_000
 const AIOSandboxSkillRoot = "/workspace/skills"
 
-// AIOSandboxToolset keeps immutable Agent-level Skill metadata and resolves
-// only the data-plane endpoint from the current ADK session.
+// AIOSandboxToolset keeps immutable Agent-level Skill metadata and prepares
+// the session sandbox lazily when a bash or file tool executes.
 type AIOSandboxToolset struct {
-	instruction string
-	tools       []tool.Tool
+	skillSpaceIDs []string
+	instruction   string
+	tools         []tool.Tool
 }
 
 // NewAIOSandboxToolset accepts a metadata snapshot discovered before the
 // Agent starts. The sandbox must materialize those Skills under
-// AIOSandboxSkillRoot/<name> from SKILL_SPACE_ID during CreateSession.
-func NewAIOSandboxToolset(metadata []skills.RemoteSkill) (*AIOSandboxToolset, error) {
-	s := &AIOSandboxToolset{}
+// AIOSandboxSkillRoot/<name> from skillSpaceIDs during its lazy creation.
+func NewAIOSandboxToolset(metadata []skills.RemoteSkill, skillSpaceIDs ...string) (*AIOSandboxToolset, error) {
+	s := &AIOSandboxToolset{skillSpaceIDs: append([]string(nil), skillSpaceIDs...)}
 	catalog := make(map[string]aioSkill, len(metadata))
 	for _, item := range metadata {
 		front := &skills.Frontmatter{Name: item.Name, Description: item.Description}
@@ -109,7 +110,7 @@ func (s *AIOSandboxToolset) Instruction() string { return s.instruction }
 type aioSkill struct{ Name, Description, Path string }
 
 func (s *AIOSandboxToolset) bash(ctx agent.Context, args bashArgs) (map[string]any, error) {
-	client, err := aioClientFor(ctx)
+	client, err := aioClientFor(ctx, s.skillSpaceIDs...)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +135,7 @@ func aioFilePath(input string) (string, error) {
 }
 
 func (s *AIOSandboxToolset) readFile(ctx agent.Context, args readFileArgs) (map[string]any, error) {
-	client, err := aioClientFor(ctx)
+	client, err := aioClientFor(ctx, s.skillSpaceIDs...)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +177,7 @@ func (s *AIOSandboxToolset) readFile(ctx agent.Context, args readFileArgs) (map[
 }
 
 func (s *AIOSandboxToolset) writeFile(ctx agent.Context, args writeFileArgs) (map[string]any, error) {
-	client, err := aioClientFor(ctx)
+	client, err := aioClientFor(ctx, s.skillSpaceIDs...)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +193,7 @@ func (s *AIOSandboxToolset) writeFile(ctx agent.Context, args writeFileArgs) (ma
 }
 
 func (s *AIOSandboxToolset) editFile(ctx agent.Context, args editFileArgs) (map[string]any, error) {
-	client, err := aioClientFor(ctx)
+	client, err := aioClientFor(ctx, s.skillSpaceIDs...)
 	if err != nil {
 		return nil, err
 	}
@@ -226,8 +227,8 @@ var aioHTTPClient = func() *http.Client {
 	return &http.Client{Transport: transport, Timeout: 35 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }()
 
-func aioClientFor(ctx agent.Context) (*aioClient, error) {
-	endpoint, err := agentkit.ResolveAIOEndpoint(ctx)
+func aioClientFor(ctx agent.Context, skillSpaceIDs ...string) (*aioClient, error) {
+	endpoint, err := agentkit.EnsureAIOToolEndpoint(ctx, skillSpaceIDs)
 	if err != nil {
 		return nil, err
 	}
